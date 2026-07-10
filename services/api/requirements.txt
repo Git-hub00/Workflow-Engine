@@ -1,3 +1,5 @@
 alembic
 sqlalchemy
 psycopg[binary]
+langgraph
+langchain-openai
