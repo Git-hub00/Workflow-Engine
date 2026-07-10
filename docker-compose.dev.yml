@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16
+    environment: { POSTGRES_USER: app, POSTGRES_PASSWORD: app, POSTGRES_DB: workflow_app }
+    ports: ["5432:5432"]
+    volumes: ["pg:/var/lib/postgresql/data"]
+  temporal:
+    image: temporalio/auto-setup:1.25.0
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=app
+      - POSTGRES_PWD=app
+      - POSTGRES_SEEDS=postgres
+    ports: ["7233:7233"]
+    depends_on: [postgres]
+  temporal-ui:
+    image: temporalio/ui:2.31.0
+    environment: [ "TEMPORAL_ADDRESS=temporal:7233" ]
+    ports: ["8080:8080"]
+    depends_on: [temporal]
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev"]
+    environment: { KEYCLOAK_ADMIN: admin, KEYCLOAK_ADMIN_PASSWORD: admin }
+    ports: ["8081:8080"]
+  ollama:
+    image: ollama/ollama:latest
+    ports: ["11434:11434"]
+    volumes: ["ollama:/root/.ollama"]
+  langfuse:
+    image: langfuse/langfuse:2
+    environment: { DATABASE_URL: postgresql://app:app@postgres:5432/langfuse, NEXTAUTH_SECRET: dev, SALT: dev, NEXTAUTH_URL: "http://localhost:3001" }
+    ports: ["3001:3000"]
+    depends_on: [postgres]
+volumes: { pg: {}, ollama: {} }
