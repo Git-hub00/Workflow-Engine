@@ -1,0 +1,14 @@
+{
+  "process_key": "invoice_approval",
+  "version": 1,
+  "config": {
+    "autoApproveUnder": 500,
+    "financeThreshold": 5000,
+    "requiredFields": ["poNumber", "costCenter", "taxId"],
+    "quorum": { "n": 2, "of": 3 },
+    "rejectShortCircuits": true,
+    "slaHours": 48,
+    "approvedVendors": ["Acme Supplies", "Globex Inc", "Initech", "Northwind Traders"]
+  },
+  "roles": { "review": "ap_clerk", "manager": "ap_manager", "finance": "finance" }
+}
