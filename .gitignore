@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Node.js (for the web UI later)
+node_modules/
+dist/
+build/
+
+# Secrets and environment files
+.env
+.env.*
+*.local
+
+# Logs and temp files
+*.log
+langfuse-log.txt
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
