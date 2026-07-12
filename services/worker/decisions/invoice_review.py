@@ -7,6 +7,8 @@
 # LLM is used only to produce a human-readable rationale explaining a decision
 # that has already been made. If the LLM is unavailable, routing still works and
 # is completely unaffected.
+import os
+
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI   # points at Ollama/vLLM (OpenAI-compatible)
 
@@ -43,8 +45,12 @@ def review_invoice(data: dict, cfg: dict) -> dict:
 # instead of raising — the deterministic route stands on its own.
 def _llm_rationale(data, cfg, route, missing, anomalies):
     try:
-        llm = ChatOpenAI(base_url="http://localhost:11434/v1", api_key="ollama",
-                         model="llama3.2:1b", temperature=0)
+        # model/base_url are env-configurable so swapping to a more advanced
+        # model or a remote server needs no code change — just set LLM_MODEL and
+        # LLM_BASE_URL.
+        llm = ChatOpenAI(base_url=os.getenv("LLM_BASE_URL", "http://localhost:11434/v1"),
+                         api_key="ollama",
+                         model=os.getenv("LLM_MODEL", "llama3.2:1b"), temperature=0)
         prompt = (f"Invoice from {data['vendor']} for ${data['amount']}. "
                   f"Missing: {missing}. Anomalies: {anomalies}. Chosen route: {route}. "
                   f"In one sentence, explain why this route is appropriate.")

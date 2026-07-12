@@ -123,13 +123,24 @@ async def append_event(
                         {"key": idempotency_key, "event_id": str(event_id)},
                     )
         except IntegrityError:
-            # Lost the race: another call already claimed this key. Our savepoint
-            # rolled back (no duplicate event); return the winner's event id.
-            existing = active_conn.execute(
-                text("SELECT event_id FROM idempotency_key WHERE key = :key"),
-                {"key": idempotency_key},
-            ).scalar_one()
-            return str(existing)
+            # An IntegrityError is ONLY the benign "already processed" case when we
+            # were deduping on an idempotency_key AND a row for that key now exists
+            # (another caller won the race to claim it). Our savepoint rolled back,
+            # so no duplicate event was left behind — return the winner's event id.
+            # ANY other IntegrityError — no key to dedupe on, or an FK / not-null
+            # violation — is a REAL failure and must surface honestly rather than
+            # be masked (e.g. an FK violation must NOT become a misleading
+            # NoResultFound from looking up a NULL key).
+            if idempotency_key is not None:
+                existing = active_conn.execute(
+                    text("SELECT event_id FROM idempotency_key WHERE key = :key"),
+                    {"key": idempotency_key},
+                ).scalar_one_or_none()
+                if existing is not None:
+                    return str(existing)
+            # No key, or key not actually present => not a dedupe conflict; re-raise
+            # the original IntegrityError so the true cause is reported.
+            raise
 
         return str(event_id)
 
