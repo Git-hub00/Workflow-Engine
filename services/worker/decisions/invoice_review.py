@@ -44,7 +44,7 @@ def review_invoice(data: dict, cfg: dict) -> dict:
 def _llm_rationale(data, cfg, route, missing, anomalies):
     try:
         llm = ChatOpenAI(base_url="http://localhost:11434/v1", api_key="ollama",
-                         model="llama3.1:8b-instruct-q4_K_M", temperature=0)
+                         model="llama3.2:1b", temperature=0)
         prompt = (f"Invoice from {data['vendor']} for ${data['amount']}. "
                   f"Missing: {missing}. Anomalies: {anomalies}. Chosen route: {route}. "
                   f"In one sentence, explain why this route is appropriate.")
