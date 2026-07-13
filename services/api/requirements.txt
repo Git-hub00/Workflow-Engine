@@ -4,3 +4,11 @@ psycopg[binary]
 langgraph
 langchain-openai
 temporalio
+fastapi
+uvicorn[standard]
+pydantic
+imapclient
+python-dotenv
+requests
+pyjwt
+cryptography

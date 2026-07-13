@@ -20,13 +20,22 @@
 #                 at-least-once activity delivery safe.
 
 import json
+import os
+import smtplib
 import sys
 import uuid
+from email.message import EmailMessage
 from pathlib import Path
 
+from dotenv import load_dotenv
 from temporalio import activity
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
+
+# Load services/api/.env at import so notify() can read SMTP config from the
+# environment. This file lives at services/worker/activities/, so the project
+# root is parents[3] and the env file is under services/api/.
+load_dotenv(Path(__file__).resolve().parents[3] / "services" / "api" / ".env")
 
 DB_URL = "postgresql+psycopg://app:app@localhost:5432/workflow_app"
 
@@ -259,18 +268,61 @@ async def create_human_task(txn_id: str, node_id: str, role: str, policy: dict |
     return token
 
 
-# WHY notify: represents the "tell a human something happened" step (e.g. email
-# the approver that a task awaits them, or the requester that info is needed).
-# MVP stub: it does NOT send anything — it only records that a notification WOULD
-# be sent, so the audit trail and tests stay deterministic and offline.
+# WHY notify: the "tell a human something happened" step — e.g. email the
+# approver that a task awaits them. It ALWAYS writes the NOTIFY audit event (the
+# durable source of truth), and additionally sends a REAL email when
+# channel == "email".
+#
+# WHY email failures are logged, not raised: notifications are best-effort side
+# effects. The workflow's correctness rests on the audit event (already written)
+# and the human's eventual reply — NOT on the email actually leaving — so an SMTP
+# hiccup, or missing config, must never fail the activity/workflow. The
+# "[invoice-<txn_id>]" subject tag is what lets a reply be correlated back to
+# this run by the email adapter (Section 9.3).
 @activity.defn
 async def notify(txn_id: str, channel: str, message: str) -> None:
-    # The audit event is this stub's ONLY database write, so append_event without
-    # conn (its own transaction) is already atomic here.
+    # 1. Durable audit write (unchanged) — the source of truth. append_event
+    #    without conn opens its own transaction, which is atomic on its own.
     await append_event(
         txn_id, "notify", "NOTIFY", "NotificationService",
         f"{channel}: {message}", idempotency_key=None,
     )
+
+    # 2. Best-effort REAL send, only for the email channel.
+    if channel != "email":
+        return
+
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    gmail_address = os.getenv("GMAIL_ADDRESS")
+    gmail_app_password = os.getenv("GMAIL_APP_PASSWORD")
+    notify_to = os.getenv("NOTIFY_TO")
+
+    # If SMTP isn't fully configured, skip sending — the audit event already
+    # succeeded, so this is not an error.
+    if not (gmail_address and gmail_app_password and notify_to):
+        print("notify: SMTP not configured, skipping send")
+        return
+
+    msg = EmailMessage()
+    # The [invoice-<txn_id>] tag ties replies back to this run (email adapter 9.3).
+    msg["Subject"] = f"[invoice-{txn_id}] {message}"
+    msg["From"] = gmail_address
+    msg["To"] = notify_to
+    msg.set_content(
+        f"{message}\n\n"
+        "Reply to this email with one of: approve / reject / return."
+    )
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(gmail_address, gmail_app_password)
+            server.send_message(msg)
+    except Exception as e:
+        # A notification failure must NOT fail the workflow — the audit event is
+        # the source of truth. Log and carry on.
+        print(f"notify: email send failed: {e}")
 
 
 # WHY post_to_erp: the terminal side-effect for an approved invoice — pushing it
