@@ -282,6 +282,9 @@ def poll_once(client, api_base_url: str) -> list[str]:
     # etc.): an error means the decision was NOT successfully delivered, so the
     # message must stay UNSEEN and be RETRIED on the next cycle rather than being
     # silently swallowed. (Idempotency on /v1/events keeps a later retry safe.)
+    # Re-SELECT INBOX each cycle: a long-lived SELECT does NOT surface messages
+    # that arrived AFTER it, so newly delivered mail would never appear in SEARCH.
+    client.select_folder("INBOX")
     results = []
     uids = client.search(["UNSEEN"])
     for uid in uids:
