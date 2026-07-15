@@ -16,7 +16,7 @@ from pathlib import Path
 
 import jwt
 from jwt import PyJWKClient
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
@@ -41,6 +41,7 @@ from invoice_workflow import InvoiceWorkflow  # noqa: E402  (after sys.path twea
 # load the DB work should be offloaded to a thread, e.g. asyncio.to_thread.)
 DB_URL = "postgresql+psycopg://app:app@localhost:5432/workflow_app"
 engine = create_engine(DB_URL)
+TEMPORAL_ADDRESS = "localhost:7233"
 
 
 # WHY lifespan: connecting to Temporal is relatively costly and should happen
@@ -50,11 +51,24 @@ engine = create_engine(DB_URL)
 # connection is torn down when the process/loop ends.)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.temporal = await Client.connect("localhost:7233")
+    app.state.temporal = await Client.connect(TEMPORAL_ADDRESS)
     yield
 
 
 app = FastAPI(title="Workflow Engine API", lifespan=lifespan)
+
+# WHY CORS: the SPA is served from a different origin (http://localhost:5173) than
+# the API (http://localhost:8000). Browsers block cross-origin XHR/fetch unless the
+# API returns CORS headers, so we allow the SPA origin explicitly.
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +136,7 @@ async def current_user(authorization: str | None = Header(default=None)) -> dict
         raise HTTPException(status_code=401, detail="invalid or expired token")
 
     roles = claims.get("realm_access", {}).get("roles", []) or []
-    return {"username": claims.get("preferred_username"), "roles": roles}
+    return {"username": claims.get("preferred_username") or claims.get("sub"), "roles": roles}
 
 
 def require_role(role: str):
@@ -139,12 +153,103 @@ def require_role(role: str):
     return _dep
 
 
+def _validate_author_finance_config(config: dict) -> tuple[int, int, bool]:
+    """Return the configured Finance quorum or reject invalid author values."""
+    quorum = config.get("quorum") if isinstance(config, dict) else None
+    required = quorum.get("n") if isinstance(quorum, dict) else None
+    capacity = quorum.get("of") if isinstance(quorum, dict) else None
+    reject_short_circuits = config.get("rejectShortCircuits") if isinstance(config, dict) else None
+    if (
+        type(required) is not int
+        or type(capacity) is not int
+        or not 1 <= required <= capacity
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="invalid Finance quorum: expected integers satisfying 1 <= quorum.n <= quorum.of",
+        )
+    if type(reject_short_circuits) is not bool:
+        raise HTTPException(
+            status_code=422,
+            detail="invalid Finance configuration: rejectShortCircuits must be a boolean",
+        )
+    return required, capacity, reject_short_circuits
+
+
+def _finance_policy_values(policy: dict) -> tuple[int, int, bool]:
+    """Read a Finance task's immutable policy, including the legacy n/of shape."""
+    if not isinstance(policy, dict):
+        raise HTTPException(status_code=409, detail="Finance task has no completion_policy")
+    quorum = policy.get("quorum")
+    if isinstance(quorum, dict):
+        required = quorum.get("n")
+        capacity = quorum.get("of")
+    else:
+        # Finance tasks created before participant slots stored n/of at the top level.
+        required = policy.get("n")
+        capacity = policy.get("of")
+    reject_short_circuits = policy.get("rejectShortCircuits")
+    if (
+        type(required) is not int
+        or type(capacity) is not int
+        or not 1 <= required <= capacity
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Finance task has invalid completion_policy quorum; expected 1 <= n <= of",
+        )
+    if type(reject_short_circuits) is not bool:
+        raise HTTPException(
+            status_code=409,
+            detail="Finance task completion_policy is missing boolean rejectShortCircuits",
+        )
+    return required, capacity, reject_short_circuits
+
+
+def _ensure_finance_slots(conn, task_id: str, capacity: int) -> None:
+    """Lazily fill participant slots for a legacy Finance task under its row lock."""
+    current = conn.execute(
+        text("SELECT count(*) FROM participant_task WHERE task_id = CAST(:task_id AS uuid)"),
+        {"task_id": task_id},
+    ).scalar_one()
+    if current > capacity:
+        raise HTTPException(
+            status_code=409,
+            detail="Finance task has more participant rows than its stored capacity",
+        )
+    for _ in range(capacity - current):
+        conn.execute(
+            text(
+                "INSERT INTO participant_task (id, task_id, status) "
+                "VALUES (CAST(:id AS uuid), CAST(:task_id AS uuid), 'open')"
+            ),
+            {"id": str(uuid.uuid4()), "task_id": task_id},
+        )
+
+
 # WHY TransactionIn: the request contract for starting a run. `process_key`
 # selects WHICH process definition to run; `data` is the raw invoice payload that
 # becomes the transaction's data_snapshot (and what extract_fields reads back).
+# WHY _optional_user: POST /v1/transactions is public (no login required), but WHEN
+# a caller IS authenticated (e.g. a vendor submitting via the SPA) we record WHO
+# submitted the invoice so the vendor portal can show request_info tasks for THEIR
+# invoices. Resolves the user if a valid Bearer token is present; returns None
+# otherwise, so the endpoint stays usable without a token (unchanged for anon callers).
+async def _optional_user(authorization: str | None = Header(default=None)) -> dict | None:
+    if not authorization:
+        return None
+    try:
+        return await current_user(authorization)
+    except HTTPException:
+        return None
+
+
 class TransactionIn(BaseModel):
     process_key: str
     data: dict
+    # Honored ONLY for tokenless callers (e.g. the email adapter). An authenticated
+    # caller's token identity always wins, so this can't be spoofed via the UI.
+    submitted_by: str | None = None
 
 
 # WHY /health: a trivial liveness probe for compose/k8s and quick manual checks.
@@ -157,7 +262,7 @@ async def health():
 # productized version of what the e2e test did manually — resolve the published
 # definition, insert the transaction row, and launch the workflow.
 @app.post("/v1/transactions")
-async def create_transaction(body: TransactionIn):
+async def create_transaction(body: TransactionIn, user: dict | None = Depends(_optional_user)):
     # 1. Resolve the PUBLISHED definition_version for this process_key (highest
     #    version). We need its id (to link the transaction) and its pdd (to build
     #    the cfg the workflow/decision node run on).
@@ -186,6 +291,7 @@ async def create_transaction(body: TransactionIn):
     # so we fold roles into the config dict (same shape the e2e test used).
     pdd = row["pdd"]  # jsonb -> dict (psycopg)
     cfg = {**pdd["config"], "roles": pdd["roles"]}
+    _validate_author_finance_config(cfg)
 
     # 2. Create the transaction row in ONE transaction: new uuid, linked to the
     #    resolved definition_version, status 'running', snapshot = posted data.
@@ -193,14 +299,19 @@ async def create_transaction(body: TransactionIn):
     with engine.begin() as conn:
         conn.execute(
             text(
-                'INSERT INTO "transaction" (id, definition_version_id, status, data_snapshot) '
-                "VALUES (CAST(:id AS uuid), CAST(:dv AS uuid), :st, CAST(:snap AS jsonb))"
+                'INSERT INTO "transaction" '
+                "(id, definition_version_id, temporal_workflow_id, status, data_snapshot, submitted_by) "
+                "VALUES (CAST(:id AS uuid), CAST(:dv AS uuid), :workflow_id, :st, CAST(:snap AS jsonb), :submitted_by)"
             ),
             {
                 "id": txn_id,
                 "dv": str(row["version_id"]),
+                "workflow_id": txn_id,
                 "st": "running",
                 "snap": json.dumps(body.data),
+                # Token identity wins; a tokenless caller (email adapter) may pass
+                # submitted_by in the body. NULL for anonymous callers with neither.
+                "submitted_by": user["username"] if user else body.submitted_by,
             },
         )
 
@@ -216,6 +327,65 @@ async def create_transaction(body: TransactionIn):
 
     # 4. Hand the caller the id they use to track/act on this run.
     return {"transaction_id": txn_id}
+
+
+# WHY POST /v1/extract-invoice: vendor portal PDF assist. Reads the PDF text and
+# asks the SAME Ollama model ai_review uses (LLM_BASE_URL / LLM_MODEL, api_key
+# "ollama") to pull invoice fields as JSON. It NEVER creates a transaction and
+# NEVER 500s — on any failure it returns {"fields": {}, "error": ...} (200) so the
+# vendor can still fill the form by hand.
+@app.post("/v1/extract-invoice")
+async def extract_invoice(file: UploadFile = File(...)):
+    import io
+    import re
+    from pypdf import PdfReader
+    from openai import OpenAI
+
+    try:
+        raw = await file.read()
+        reader = PdfReader(io.BytesIO(raw))
+        text_content = "\n".join((page.extract_text() or "") for page in reader.pages)
+    except Exception as exc:
+        return {"fields": {}, "error": f"could not read PDF: {exc}"}
+
+    if not text_content.strip():
+        return {"fields": {}, "error": "no extractable text in PDF", "raw_text_len": 0}
+
+    try:
+        client = OpenAI(
+            base_url=os.getenv("LLM_BASE_URL", "http://localhost:11434/v1"),
+            api_key="ollama",
+        )
+        completion = client.chat.completions.create(
+            model=os.getenv("LLM_MODEL", "llama3.2:1b"),
+            temperature=0,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Extract these fields as JSON only: vendor, amount, poNumber, "
+                        "costCenter, taxId. Use null for anything not found. Output ONLY JSON.\n\n"
+                        f"Invoice text:\n{text_content[:6000]}"
+                    ),
+                }
+            ],
+        )
+        content = completion.choices[0].message.content or ""
+    except Exception as exc:
+        return {"fields": {}, "error": f"LLM error: {exc}", "raw_text_len": len(text_content)}
+
+    # Defensive parse: strip ``` fences, then take the first {...} block.
+    cleaned = re.sub(r"^```(?:json)?|```$", "", content.strip(), flags=re.MULTILINE).strip()
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    try:
+        parsed = json.loads(match.group(0) if match else cleaned)
+    except Exception:
+        return {"fields": {}, "error": "could not parse LLM output as JSON", "raw_text_len": len(text_content)}
+    if not isinstance(parsed, dict):
+        return {"fields": {}, "error": "LLM did not return a JSON object", "raw_text_len": len(text_content)}
+
+    fields = {key: parsed.get(key) for key in ("vendor", "amount", "poNumber", "costCenter", "taxId")}
+    return {"fields": fields, "raw_text_len": len(text_content)}
 
 
 # WHY EventIn: the request contract for the Event Ingress (Section 9.2) — the way
@@ -239,6 +409,11 @@ class EventIn(BaseModel):
 # workflow and lets it continue.
 @app.post("/v1/events")
 async def ingest_event(evt: EventIn):
+    if evt.kind == "finance":
+        raise HTTPException(
+            status_code=400,
+            detail="Finance decisions must use the task complete endpoint after claiming a participant slot",
+        )
     # The audit event's type reflects what kind of decision this is.
     event_type = "FINANCE_VOTE" if evt.kind == "finance" else "HUMAN_DECISION"
     event_id = str(uuid.uuid4())
@@ -254,6 +429,7 @@ async def ingest_event(evt: EventIn):
     # a bad transaction_id on the EVENT insert — is NOT masked as a duplicate but
     # surfaces honestly (same principle as the append_event fix).
     dup = False
+    task_already_done = False
     try:
         with engine.begin() as conn:
             # (a) record the decision in the immutable event log.
@@ -284,22 +460,31 @@ async def ingest_event(evt: EventIn):
                 dup = True
                 raise  # abort the whole transaction (rolls back the event too)
 
-            # (c) best-effort: mark the human task done (only if a token was given).
-            # COALESCE keeps any existing claimed_by when the payload doesn't carry one.
-            if evt.task_token is not None:
-                conn.execute(
+            # (c) mark the human task done — the SINGLE-USE LATCH that gives
+            # first-wins dedup across channels (both app Send and email reply pass
+            # task_token). The atomic open->done flip picks the winner: if it
+            # changes NO row the task was ALREADY done (the OTHER channel won), so
+            # we skip the signal below to avoid a double-apply.
+            if evt.task_token is not None and evt.kind != "finance":
+                updated = conn.execute(
                     text(
                         "UPDATE task SET status = 'done', "
                         "claimed_by = COALESCE(:claimed_by, claimed_by) "
-                        "WHERE token = :token"
+                        "WHERE token = :token AND status <> 'done'"
                     ),
                     {"claimed_by": evt.payload.get("claimed_by"), "token": evt.task_token},
                 )
+                task_already_done = updated.rowcount == 0
     except IntegrityError:
         if dup:
             # Already processed — safe no-op. No signal, no other side effects.
             return {"status": "duplicate-ignored"}
         raise  # a real integrity failure (e.g. unknown transaction_id) — surface it
+
+    # First-wins: a task_token whose task was ALREADY done means the OTHER channel
+    # completed it first — the audit event is recorded, but we do NOT signal again.
+    if task_already_done:
+        return {"status": "task-already-done"}
 
     # (d) Signal the durably-paused workflow to RESUME. The workflow id is the
     # transaction id (set when the run was started). finance votes go to the
@@ -321,6 +506,35 @@ async def ingest_event(evt: EventIn):
     return {"status": "accepted"}
 
 
+# WHY GET /v1/transactions/{txn_id}/open-task: an OPEN read the email adapter uses
+# to resolve a transaction's CURRENT open human task — its token (to complete the
+# exact task, enabling first-wins dedup with the app), node_id (resubmit vs
+# approve/reject) and missing fields. Returns {"open_task": null} when none is open.
+@app.get("/v1/transactions/{txn_id}/open-task")
+async def transaction_open_task(txn_id: str):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT token, node_id, assigned_role, completion_policy "
+                "FROM task WHERE transaction_id = CAST(:t AS uuid) AND status = 'open' "
+                "ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"t": txn_id},
+        ).mappings().first()
+    if row is None:
+        return {"open_task": None}
+    policy = row["completion_policy"] if isinstance(row["completion_policy"], dict) else {}
+    need = policy.get("need") if isinstance(policy.get("need"), list) else None
+    return {
+        "open_task": {
+            "token": row["token"],
+            "node_id": row["node_id"],
+            "assigned_role": row["assigned_role"],
+            "need": need,
+        }
+    }
+
+
 # ===========================================================================
 # Task Service (Section 9.4): the role-based human task inbox — list open work,
 # atomically claim a task, and complete it (which funnels into the event ingress).
@@ -330,7 +544,11 @@ async def ingest_event(evt: EventIn):
 # WHY GET /v1/tasks: the "pull my queue" endpoint a role-based task inbox uses —
 # a manager's UI asks for the open tasks assigned to their role.
 @app.get("/v1/tasks")
-async def list_tasks(role: str | None = None, status: str = "open"):
+async def list_tasks(
+    role: str | None = None,
+    status: str = "open",
+    user: dict = Depends(current_user),
+):
     # (CAST(:role AS text) IS NULL OR assigned_role = :role) makes `role` optional
     # in one query; the CAST avoids Postgres "could not determine parameter type"
     # when role is NULL.
@@ -338,7 +556,7 @@ async def list_tasks(role: str | None = None, status: str = "open"):
         rows = conn.execute(
             text(
                 "SELECT id, transaction_id, node_id, token, assigned_role, "
-                "       status, claimed_by, created_at "
+                "       status, claimed_by, completion_policy, created_at "
                 "FROM task "
                 "WHERE status = :status "
                 "AND (CAST(:role AS text) IS NULL OR assigned_role = CAST(:role AS text)) "
@@ -347,20 +565,104 @@ async def list_tasks(role: str | None = None, status: str = "open"):
             {"status": status, "role": role},
         ).mappings().all()
 
+        result = []
+        for row in rows:
+            item = {
+                "id": str(row["id"]),
+                "transaction_id": str(row["transaction_id"]),
+                "node_id": row["node_id"],
+                "token": row["token"],
+                "assigned_role": row["assigned_role"],
+                "status": row["status"],
+                "claimed_by": row["claimed_by"],
+                "completion_policy": row["completion_policy"],
+                "created_at": str(row["created_at"]) if row["created_at"] is not None else None,
+            }
+            if row["node_id"] == "finance":
+                try:
+                    required, capacity, reject_short_circuits = _finance_policy_values(
+                        row["completion_policy"]
+                    )
+                except HTTPException:
+                    # DURABLE FIX: a malformed / legacy finance policy (e.g. one
+                    # missing a boolean rejectShortCircuits) must NEVER 409 the
+                    # WHOLE /v1/tasks endpoint — that blanks every user's inbox.
+                    # Degrade THIS card only: mark it unavailable, skip enrichment,
+                    # and let the rest of the list render normally.
+                    item["finance_unavailable"] = True
+                else:
+                    participants = conn.execute(
+                        text(
+                            "SELECT id, claimed_by, decision, status "
+                            "FROM participant_task WHERE task_id = CAST(:task_id AS uuid)"
+                        ),
+                        {"task_id": str(row["id"])},
+                    ).mappings().all()
+                    claimed = [participant for participant in participants if participant["claimed_by"]]
+                    completed = [participant for participant in participants if participant["decision"]]
+                    approvals = [
+                        participant
+                        for participant in completed
+                        if participant["decision"].get("decision") == "approve"
+                    ]
+                    rejections = [
+                        participant
+                        for participant in completed
+                        if participant["decision"].get("decision") == "reject"
+                    ]
+                    current_participant = next(
+                        (
+                            participant
+                            for participant in participants
+                            if participant["claimed_by"] == user["username"]
+                        ),
+                        None,
+                    )
+                    current_decision = (
+                        current_participant["decision"].get("decision")
+                        if current_participant and current_participant["decision"]
+                        else None
+                    )
+                    unmaterialized_slots = max(capacity - len(participants), 0)
+                    available_slots = sum(
+                        1
+                        for participant in participants
+                        if participant["claimed_by"] is None and participant["status"] == "open"
+                    ) + unmaterialized_slots
+                    has_role = row["assigned_role"] in user["roles"]
+                    item.update(
+                        {
+                            "required_approvals": required,
+                            "participant_capacity": capacity,
+                            "claimed_count": len(claimed),
+                            "approval_count": len(approvals),
+                            "rejection_count": len(rejections),
+                            "completed_count": len(completed),
+                            "available_slots": available_slots,
+                            "current_user_claimed": current_participant is not None,
+                            "current_user_participant_id": (
+                                str(current_participant["id"]) if current_participant else None
+                            ),
+                            "current_user_decision": current_decision,
+                            "can_claim": (
+                                row["status"] == "open"
+                                and has_role
+                                and current_participant is None
+                                and available_slots > 0
+                            ),
+                            "can_decide": (
+                                row["status"] == "open"
+                                and has_role
+                                and current_participant is not None
+                                and current_decision is None
+                            ),
+                            "reject_short_circuits": reject_short_circuits,
+                        }
+                    )
+            result.append(item)
+
     # Cast uuids/timestamps to str so the payload is JSON-serializable.
-    return [
-        {
-            "id": str(r["id"]),
-            "transaction_id": str(r["transaction_id"]),
-            "node_id": r["node_id"],
-            "token": r["token"],
-            "assigned_role": r["assigned_role"],
-            "status": r["status"],
-            "claimed_by": r["claimed_by"],
-            "created_at": str(r["created_at"]) if r["created_at"] is not None else None,
-        }
-        for r in rows
-    ]
+    return result
 
 
 # WHY ClaimIn: who is taking ownership of the task.
@@ -377,12 +679,75 @@ async def claim_task(token: str, body: ClaimIn, user: dict = Depends(current_use
     # endpoint with a fixed role. (Unknown token -> None -> fall through to the
     # atomic claim below, which reports 409.)
     with engine.connect() as conn:
-        assigned_role = conn.execute(
-            text("SELECT assigned_role FROM task WHERE token = :token"),
+        task_row = conn.execute(
+            text("SELECT assigned_role, node_id FROM task WHERE token = :token"),
             {"token": token},
-        ).scalar_one_or_none()
+        ).mappings().first()
+    assigned_role = task_row["assigned_role"] if task_row is not None else None
     if assigned_role is not None and assigned_role not in user["roles"]:
         raise HTTPException(status_code=403, detail=f"requires role '{assigned_role}'")
+
+    if task_row is not None and task_row["node_id"] == "finance":
+        with engine.begin() as conn:
+            finance_task = conn.execute(
+                text(
+                    "SELECT id, status, completion_policy FROM task "
+                    "WHERE token = :token FOR UPDATE"
+                ),
+                {"token": token},
+            ).mappings().first()
+            if finance_task is None:
+                raise HTTPException(status_code=404, detail="task not found")
+            required, capacity, _ = _finance_policy_values(finance_task["completion_policy"])
+
+            # Serialize repeat claims by this user even when two browser requests race.
+            conn.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:claim_key, 0))"),
+                {"claim_key": f"{finance_task['id']}:{user['username']}"},
+            )
+            existing = conn.execute(
+                text(
+                    "SELECT id, status, decision FROM participant_task "
+                    "WHERE task_id = CAST(:task_id AS uuid) AND claimed_by = :username "
+                    "LIMIT 1"
+                ),
+                {"task_id": str(finance_task["id"]), "username": user["username"]},
+            ).mappings().first()
+            if existing is not None:
+                return {
+                    "status": "finance-slot-claimed",
+                    "participant_id": str(existing["id"]),
+                    "claimed_by": user["username"],
+                    "decision": existing["decision"],
+                    "required_approvals": required,
+                    "participant_capacity": capacity,
+                }
+            if finance_task["status"] != "open":
+                raise HTTPException(status_code=409, detail="Finance task is no longer open")
+            _ensure_finance_slots(conn, str(finance_task["id"]), capacity)
+
+            participant = conn.execute(
+                text(
+                    "UPDATE participant_task SET participant = :username, "
+                    "claimed_by = :username, status = 'claimed' "
+                    "WHERE id = ("
+                    "  SELECT id FROM participant_task "
+                    "  WHERE task_id = CAST(:task_id AS uuid) "
+                    "    AND claimed_by IS NULL AND status = 'open' "
+                    "  ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1"
+                    ") RETURNING id, status"
+                ),
+                {"task_id": str(finance_task["id"]), "username": user["username"]},
+            ).mappings().first()
+            if participant is None:
+                raise HTTPException(status_code=409, detail="All Finance participant slots are claimed")
+            return {
+                "status": "finance-slot-claimed",
+                "participant_id": str(participant["id"]),
+                "claimed_by": user["username"],
+                "required_approvals": required,
+                "participant_capacity": capacity,
+            }
 
     # WHY the single UPDATE ... WHERE status='open' ... RETURNING is atomic: two
     # users racing to claim the same task both run this exact statement, but the
@@ -418,6 +783,171 @@ class CompleteIn(BaseModel):
     kind: str = "human"
 
 
+async def _complete_finance_task(token: str, body: CompleteIn, user: dict) -> dict:
+    decision = body.payload.get("decision")
+    if decision not in {"approve", "reject"}:
+        raise HTTPException(
+            status_code=422,
+            detail="Finance decision must be either 'approve' or 'reject'",
+        )
+
+    duplicate = False
+    signal_payload = None
+    response = None
+    try:
+        with engine.begin() as conn:
+            if conn.execute(
+                text("SELECT 1 FROM idempotency_key WHERE key = :key"),
+                {"key": body.idempotency_key},
+            ).first() is not None:
+                return {"status": "duplicate-ignored"}
+
+            task_row = conn.execute(
+                text(
+                    "SELECT id, transaction_id, status, completion_policy FROM task "
+                    "WHERE token = :token AND node_id = 'finance' FOR UPDATE"
+                ),
+                {"token": token},
+            ).mappings().first()
+            if task_row is None:
+                raise HTTPException(status_code=404, detail="Finance task not found")
+            if task_row["status"] != "open":
+                raise HTTPException(status_code=409, detail="Finance task is no longer open")
+
+            required, capacity, reject_short_circuits = _finance_policy_values(
+                task_row["completion_policy"]
+            )
+            participant = conn.execute(
+                text(
+                    "SELECT id, decision, status FROM participant_task "
+                    "WHERE task_id = CAST(:task_id AS uuid) AND claimed_by = :username "
+                    "FOR UPDATE"
+                ),
+                {"task_id": str(task_row["id"]), "username": user["username"]},
+            ).mappings().first()
+            if participant is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Claim a Finance participant slot before submitting a decision",
+                )
+            if participant["decision"] is not None or participant["status"] == "done":
+                raise HTTPException(status_code=409, detail="This Finance user has already decided")
+
+            conn.execute(
+                text(
+                    "UPDATE participant_task SET decision = CAST(:decision AS jsonb), status = 'done' "
+                    "WHERE id = CAST(:id AS uuid)"
+                ),
+                {
+                    "id": str(participant["id"]),
+                    "decision": json.dumps({"decision": decision}),
+                },
+            )
+
+            counts = conn.execute(
+                text(
+                    "SELECT "
+                    " count(*) FILTER (WHERE claimed_by IS NOT NULL) AS claimed_count, "
+                    " count(*) FILTER (WHERE decision->>'decision' = 'approve') AS approval_count, "
+                    " count(*) FILTER (WHERE decision->>'decision' = 'reject') AS rejection_count, "
+                    " count(*) FILTER (WHERE decision IS NOT NULL) AS completed_count "
+                    "FROM participant_task WHERE task_id = CAST(:task_id AS uuid)"
+                ),
+                {"task_id": str(task_row["id"])},
+            ).mappings().one()
+            approval_count = counts["approval_count"]
+            rejection_count = counts["rejection_count"]
+            completed_count = counts["completed_count"]
+            remaining_undecided_slots = max(capacity - completed_count, 0)
+
+            finance_result = "pending"
+            if reject_short_circuits and rejection_count > 0:
+                finance_result = "rejected"
+            elif approval_count >= required:
+                finance_result = "approved"
+            elif (
+                not reject_short_circuits
+                and approval_count + remaining_undecided_slots < required
+            ):
+                finance_result = "rejected"
+
+            event_id = str(uuid.uuid4())
+            event_payload = {
+                "participant": user["username"],
+                "participant_id": str(participant["id"]),
+                "decision": decision,
+            }
+            conn.execute(
+                text(
+                    "INSERT INTO event (id, transaction_id, type, payload, actor) "
+                    "VALUES (CAST(:id AS uuid), CAST(:txn AS uuid), 'FINANCE_VOTE', "
+                    "        CAST(:payload AS jsonb), :actor)"
+                ),
+                {
+                    "id": event_id,
+                    "txn": str(task_row["transaction_id"]),
+                    "payload": json.dumps(event_payload),
+                    "actor": user["username"],
+                },
+            )
+            try:
+                conn.execute(
+                    text(
+                        "INSERT INTO idempotency_key (key, event_id) "
+                        "VALUES (:key, CAST(:event_id AS uuid))"
+                    ),
+                    {"key": body.idempotency_key, "event_id": event_id},
+                )
+            except IntegrityError:
+                duplicate = True
+                raise
+
+            if finance_result != "pending":
+                conn.execute(
+                    text("UPDATE task SET status = 'done' WHERE id = CAST(:id AS uuid)"),
+                    {"id": str(task_row["id"])},
+                )
+                conn.execute(
+                    text(
+                        "UPDATE participant_task SET status = 'done' "
+                        "WHERE task_id = CAST(:task_id AS uuid) AND status <> 'done'"
+                    ),
+                    {"task_id": str(task_row["id"])},
+                )
+                signal_payload = {
+                    "terminal": True,
+                    "decision": "approve" if finance_result == "approved" else "reject",
+                }
+
+            response = {
+                "status": "accepted",
+                "finance_status": finance_result,
+                "claimed_count": counts["claimed_count"],
+                "approval_count": approval_count,
+                "rejection_count": rejection_count,
+                "completed_count": completed_count,
+                "remaining_undecided_slots": remaining_undecided_slots,
+                "required_approvals": required,
+                "participant_capacity": capacity,
+            }
+    except IntegrityError:
+        if duplicate:
+            return {"status": "duplicate-ignored"}
+        raise
+
+    if signal_payload is not None:
+        handle = app.state.temporal.get_workflow_handle(str(task_row["transaction_id"]))
+        try:
+            await handle.signal("finance_vote", signal_payload)
+        except RPCError as exc:
+            message = str(exc).lower()
+            if "already completed" in message or "not found" in message:
+                response["status"] = "workflow-already-closed"
+            else:
+                raise
+    return response
+
+
 # WHY POST /v1/tasks/{token}/complete: completing a task IS submitting its
 # decision. Rather than duplicate the record-event + dedupe + signal logic, we
 # resolve the task's transaction and funnel through the SAME ingest_event path,
@@ -426,7 +956,7 @@ class CompleteIn(BaseModel):
 async def complete_task(token: str, body: CompleteIn, user: dict = Depends(current_user)):
     with engine.connect() as conn:
         row = conn.execute(
-            text("SELECT transaction_id, assigned_role FROM task WHERE token = :token"),
+            text("SELECT transaction_id, assigned_role, node_id FROM task WHERE token = :token"),
             {"token": token},
         ).mappings().first()
     if row is None:
@@ -436,6 +966,9 @@ async def complete_task(token: str, body: CompleteIn, user: dict = Depends(curre
     assigned_role = row["assigned_role"]
     if assigned_role is not None and assigned_role not in user["roles"]:
         raise HTTPException(status_code=403, detail=f"requires role '{assigned_role}'")
+
+    if row["node_id"] == "finance":
+        return await _complete_finance_task(token, body, user)
 
     evt = EventIn(
         transaction_id=str(row["transaction_id"]),
@@ -483,8 +1016,14 @@ class ConfigIn(BaseModel):
 
 
 # WHY PUT /v1/config/{process_key}: update the config knobs in place.
+# WHY gated by process_author: editing the PUBLISHED process rules is a
+# privileged, publish-like action (it changes what every future run does), so per
+# the Section 10 acceptance ("only process_author can publish definitions") only
+# a caller holding the process_author realm role may do it. Reading config (GET)
+# stays open. require_role() 403s callers without the role (and 401s no/invalid token).
 @app.put("/v1/config/{process_key}")
-async def put_config(process_key: str, body: ConfigIn):
+async def put_config(process_key: str, body: ConfigIn, user: dict = Depends(require_role("process_author"))):
+    _validate_author_finance_config(body.config)
     with engine.connect() as conn:
         row = conn.execute(
             text(
@@ -517,3 +1056,90 @@ async def put_config(process_key: str, body: ConfigIn):
     # with these new values (this mirrors the prototype's Config tab). In-flight
     # workflows keep the cfg snapshot they were started with — only new runs change.
     return {"status": "updated", "process_key": process_key, "config": body.config}
+
+
+# ===========================================================================
+# Read-only views (Section 11 prep): feed a monitor/dashboard UI — list recent
+# runs and replay a single run's audit timeline. Left open (no auth) like the
+# other GETs.
+# ===========================================================================
+
+
+# WHY GET /v1/transactions: the dashboard's "recent runs" list — the 100 most
+# recent transactions with their current status and the invoice snapshot.
+@app.get("/v1/transactions")
+async def list_transactions():
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT tr.id, pd.process_key, tr.definition_version_id, "
+                "       dv.version AS definition_version, tr.status, tr.data_snapshot, "
+                "       tr.submitted_by, "
+                "       tr.created_at, tr.closed_at, "
+                "       COALESCE(tr.temporal_workflow_id, CAST(tr.id AS text)) AS temporal_workflow_id, "
+                "       tr.temporal_run_id "
+                'FROM "transaction" tr '
+                "LEFT JOIN definition_version dv ON dv.id = tr.definition_version_id "
+                "LEFT JOIN process_definition pd ON pd.id = dv.definition_id "
+                "ORDER BY tr.created_at DESC, tr.id DESC LIMIT 100"
+            )
+        ).mappings().all()
+    # Stringify uuid/timestamp so the payload is JSON-serializable; data_snapshot
+    # is jsonb and already deserializes to a dict.
+    return [
+        {
+            "id": str(r["id"]),
+            "process_key": r["process_key"],
+            "definition_version_id": (
+                str(r["definition_version_id"]) if r["definition_version_id"] is not None else None
+            ),
+            "definition_version": r["definition_version"],
+            "status": r["status"],
+            "data_snapshot": r["data_snapshot"],
+            "submitted_by": r["submitted_by"],
+            "created_at": str(r["created_at"]) if r["created_at"] is not None else None,
+            "closed_at": str(r["closed_at"]) if r["closed_at"] is not None else None,
+            "temporal_workflow_id": r["temporal_workflow_id"],
+            "temporal_run_id": r["temporal_run_id"],
+        }
+        for r in rows
+    ]
+
+
+# WHY GET /v1/transactions/{txn_id}/history: replay ONE run's immutable audit log
+# in order — the timeline a monitor UI shows (started -> LLM decision -> task ->
+# notify -> ... -> outcome).
+@app.get("/v1/transactions/{txn_id}/history")
+async def transaction_history(txn_id: str):
+    with engine.connect() as conn:
+        # 404 rather than returning an empty list for a txn that doesn't exist.
+        exists = conn.execute(
+            text('SELECT 1 FROM "transaction" WHERE id = CAST(:id AS uuid)'),
+            {"id": txn_id},
+        ).first()
+        if exists is None:
+            raise HTTPException(status_code=404, detail="transaction not found")
+
+        rows = conn.execute(
+            text(
+                "SELECT type, actor, payload, occurred_at FROM event "
+                "WHERE transaction_id = CAST(:id AS uuid) "
+                "ORDER BY occurred_at, seq"
+            ),
+            {"id": txn_id},
+        ).mappings().all()
+
+    out = []
+    for r in rows:
+        payload = r["payload"]  # jsonb -> dict (or None)
+        detail = payload.get("detail") if isinstance(payload, dict) else None
+        out.append(
+            {
+                "type": r["type"],
+                "actor": r["actor"],
+                "payload": payload,
+                "occurred_at": str(r["occurred_at"]) if r["occurred_at"] is not None else None,
+                "detail": detail,
+            }
+        )
+    return out

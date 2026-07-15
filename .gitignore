@@ -19,6 +19,12 @@ build/
 .env.*
 *.local
 
+# Keys / certificates
+*.pem
+*.key
+*.pfx
+*_key
+
 # Logs and temp files
 *.log
 langfuse-log.txt

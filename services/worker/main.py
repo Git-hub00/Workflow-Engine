@@ -47,6 +47,7 @@ from invoice_activities import (  # noqa: E402  (import after sys.path tweak)
     create_human_task,
     notify,
     post_to_erp,
+    set_transaction_status,
 )
 from invoice_workflow import InvoiceWorkflow  # noqa: E402
 
@@ -61,7 +62,7 @@ async def main():
         client,
         task_queue="invoice-tq",
         workflows=[InvoiceWorkflow],
-        activities=[append_event, extract_fields, create_human_task, notify, post_to_erp],
+        activities=[append_event, extract_fields, create_human_task, notify, post_to_erp, set_transaction_status],
         activity_executor=ThreadPoolExecutor(max_workers=8),
     )
 

@@ -27,6 +27,7 @@ import uuid
 from email.message import EmailMessage
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
 from temporalio import activity
 from sqlalchemy import create_engine, text
@@ -218,12 +219,80 @@ async def create_human_task(txn_id: str, node_id: str, role: str, policy: dict |
     token = uuid.uuid4().hex  # opaque unique claim token for this task
     policy_json = json.dumps(policy) if policy is not None else None
 
+    finance_capacity = None
+    if node_id == "finance":
+        quorum = policy.get("quorum") if isinstance(policy, dict) else None
+        required = quorum.get("n") if isinstance(quorum, dict) else None
+        finance_capacity = quorum.get("of") if isinstance(quorum, dict) else None
+        reject_short_circuits = (
+            policy.get("rejectShortCircuits") if isinstance(policy, dict) else None
+        )
+        if (
+            type(required) is not int
+            or type(finance_capacity) is not int
+            or not 1 <= required <= finance_capacity
+        ):
+            raise ValueError(
+                "invalid Finance quorum: expected integers satisfying 1 <= quorum.n <= quorum.of"
+            )
+        if type(reject_short_circuits) is not bool:
+            raise ValueError(
+                "invalid Finance configuration: rejectShortCircuits must be a boolean"
+            )
+
     # The task row, any participant_task rows, AND the TASK_CREATED audit event
     # all commit in ONE transaction: we pass this same `conn` to
     # append_event(conn=conn) so the audit event is written together with the
     # business rows (strict atomicity — never a task without its audit event, or
     # an audit event without its task).
     with engine.begin() as conn:
+        if node_id == "finance":
+            # Lock the transaction projection so an overlapping Temporal activity
+            # retry cannot create a second Finance parent task.
+            conn.execute(
+                text('SELECT id FROM "transaction" WHERE id = CAST(:txn AS uuid) FOR UPDATE'),
+                {"txn": txn_id},
+            )
+            existing = conn.execute(
+                text(
+                    "SELECT id, token, status, completion_policy FROM task "
+                    "WHERE transaction_id = CAST(:txn AS uuid) AND node_id = 'finance' "
+                    "ORDER BY created_at LIMIT 1"
+                ),
+                {"txn": txn_id},
+            ).mappings().first()
+            if existing is not None:
+                existing_policy = existing["completion_policy"] or {}
+                existing_quorum = existing_policy.get("quorum")
+                if isinstance(existing_quorum, dict):
+                    existing_capacity = existing_quorum.get("of")
+                else:
+                    # A pre-slot Finance task stored n/of at the top level.
+                    existing_capacity = existing_policy.get("of")
+                if type(existing_capacity) is not int or existing_capacity < 1:
+                    raise ValueError("existing Finance task has invalid completion_policy")
+                participant_count = conn.execute(
+                    text(
+                        "SELECT count(*) FROM participant_task "
+                        "WHERE task_id = CAST(:task_id AS uuid)"
+                    ),
+                    {"task_id": str(existing["id"])},
+                ).scalar_one()
+                if participant_count > existing_capacity:
+                    raise ValueError(
+                        "existing Finance task has more participant rows than its capacity"
+                    )
+                if existing["status"] != "done":
+                    for _ in range(existing_capacity - participant_count):
+                        conn.execute(
+                            text(
+                                "INSERT INTO participant_task (id, task_id, status) "
+                                "VALUES (CAST(:id AS uuid), CAST(:task_id AS uuid), 'open')"
+                            ),
+                            {"id": str(uuid.uuid4()), "task_id": str(existing["id"])},
+                        )
+                return existing["token"]
+
         conn.execute(
             text(
                 "INSERT INTO task (id, transaction_id, node_id, token, assigned_role, "
@@ -245,8 +314,10 @@ async def create_human_task(txn_id: str, node_id: str, role: str, policy: dict |
         # If the policy defines a quorum {"n": needed, "of": total}, pre-create
         # `of` participant_task rows (participant left NULL until assigned).
         quorum = policy.get("quorum") if isinstance(policy, dict) else None
-        total = quorum.get("of") if isinstance(quorum, dict) else None
-        if isinstance(total, int) and total > 0:
+        total = finance_capacity if node_id == "finance" else (
+            quorum.get("of") if isinstance(quorum, dict) else None
+        )
+        if type(total) is int and total > 0:
             for _ in range(total):
                 conn.execute(
                     text(
@@ -279,6 +350,56 @@ async def create_human_task(txn_id: str, node_id: str, role: str, policy: dict |
 # hiccup, or missing config, must never fail the activity/workflow. The
 # "[invoice-<txn_id>]" subject tag is what lets a reply be correlated back to
 # this run by the email adapter (Section 9.3).
+def _vendor_email_for_txn(txn_id: str) -> str | None:
+    # For a request_info step, resolve the submitting vendor's Keycloak email.
+    # Returns None (caller falls back to NOTIFY_TO) for a non-request_info step, a
+    # null submitted_by, a missing email, or any Keycloak error. No workflow-arg
+    # plumbing needed: everything is derived from txn_id.
+    with engine.connect() as conn:
+        node = conn.execute(
+            text(
+                "SELECT node_id FROM task WHERE transaction_id = CAST(:t AS uuid) "
+                "AND status = 'open' ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"t": txn_id},
+        ).scalar_one_or_none()
+        if node != "request_info":
+            return None
+        submitted_by = conn.execute(
+            text('SELECT submitted_by FROM "transaction" WHERE id = CAST(:t AS uuid)'),
+            {"t": txn_id},
+        ).scalar_one_or_none()
+    if not submitted_by:
+        return None
+    try:
+        kc = os.getenv("KEYCLOAK_URL", "http://localhost:8081")
+        realm = os.getenv("KEYCLOAK_REALM", "workflow")
+        token = requests.post(
+            f"{kc}/realms/master/protocol/openid-connect/token",
+            data={
+                "client_id": "admin-cli",
+                "grant_type": "password",
+                "username": os.getenv("KEYCLOAK_ADMIN", "admin"),
+                "password": os.getenv("KEYCLOAK_ADMIN_PASSWORD", "admin"),
+            },
+            timeout=10,
+        ).json().get("access_token")
+        if not token:
+            return None
+        users = requests.get(
+            f"{kc}/admin/realms/{realm}/users",
+            params={"username": submitted_by, "exact": "true"},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        ).json()
+        for user in users if isinstance(users, list) else []:
+            if user.get("email"):
+                return user["email"]
+    except Exception as exc:
+        print(f"notify: vendor email lookup failed: {exc}")
+    return None
+
+
 @activity.defn
 async def notify(txn_id: str, channel: str, message: str) -> None:
     # 1. Durable audit write (unchanged) — the source of truth. append_event
@@ -297,10 +418,13 @@ async def notify(txn_id: str, channel: str, message: str) -> None:
     gmail_address = os.getenv("GMAIL_ADDRESS")
     gmail_app_password = os.getenv("GMAIL_APP_PASSWORD")
     notify_to = os.getenv("NOTIFY_TO")
+    # request_info notifications target the SUBMITTING vendor's Keycloak email;
+    # everything else (and any resolution failure) falls back to NOTIFY_TO.
+    recipient = _vendor_email_for_txn(txn_id) or notify_to
 
     # If SMTP isn't fully configured, skip sending — the audit event already
     # succeeded, so this is not an error.
-    if not (gmail_address and gmail_app_password and notify_to):
+    if not (gmail_address and gmail_app_password and recipient):
         print("notify: SMTP not configured, skipping send")
         return
 
@@ -308,7 +432,7 @@ async def notify(txn_id: str, channel: str, message: str) -> None:
     # The [invoice-<txn_id>] tag ties replies back to this run (email adapter 9.3).
     msg["Subject"] = f"[invoice-{txn_id}] {message}"
     msg["From"] = gmail_address
-    msg["To"] = notify_to
+    msg["To"] = recipient
     msg.set_content(
         f"{message}\n\n"
         "Reply to this email with one of: approve / reject / return."
@@ -337,3 +461,38 @@ async def post_to_erp(txn_id: str, data: dict) -> None:
         txn_id, "ext", "ERP_POSTED", "post_to_erp",
         "Invoice posted to ERP (stub)", idempotency_key=None,
     )
+
+
+# WHY set_transaction_status: the transaction row is created with status='running'
+# and nothing ever updated it, so the Monitor UI showed every run as 'running'
+# even after it finished. A workflow can't touch the DB directly (only activities
+# can), so _finish calls this at the end of a run to persist the terminal outcome
+# ('approved' / 'rejected') to transaction.status — making the DB reflect the true
+# final state.
+@activity.defn
+async def set_transaction_status(txn_id: str, status: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                'UPDATE "transaction" SET status = :status, '
+                'closed_at = COALESCE(closed_at, now()) '
+                'WHERE id = CAST(:id AS uuid)'
+            ),
+            {"status": status, "id": txn_id},
+        )
+        conn.execute(
+            text(
+                "UPDATE task SET status = 'done' "
+                "WHERE transaction_id = CAST(:id AS uuid) AND status <> 'done'"
+            ),
+            {"id": txn_id},
+        )
+        conn.execute(
+            text(
+                "UPDATE participant_task SET status = 'done' "
+                "WHERE task_id IN ("
+                "    SELECT id FROM task WHERE transaction_id = CAST(:id AS uuid)"
+                ") AND status IS DISTINCT FROM 'done'"
+            ),
+            {"id": txn_id},
+        )

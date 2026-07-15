@@ -12,3 +12,5 @@ python-dotenv
 requests
 pyjwt
 cryptography
+pypdf
+python-multipart
