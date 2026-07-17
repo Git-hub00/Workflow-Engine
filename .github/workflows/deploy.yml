@@ -55,8 +55,8 @@ jobs:
             git pull --ff-only origin LangGraph-1
 
             # --- write services/api/.env (backend/runtime config; not committed) ---
-            # Heredoc is quoted-free so the ${{ }} values are substituted by Actions
-            # BEFORE reaching the VM; GitHub masks secrets in the run log.
+            # The templated values below are substituted by Actions BEFORE reaching
+            # the VM; GitHub masks secrets in the run log.
             mkdir -p services/api
             cat > services/api/.env <<'ENVEOF'
             GMAIL_ADDRESS=${{ vars.GMAIL_ADDRESS }}
