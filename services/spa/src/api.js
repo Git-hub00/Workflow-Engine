@@ -1,6 +1,9 @@
 import keycloak from './keycloak'
 
-const API_BASE_URL = 'http://localhost:8000'
+// Build-time config. In production the pipeline sets VITE_API_BASE_URL=/api so
+// the SPA calls the API same-origin through nginx (no CORS). Dev falls back to
+// the local API on :8000.
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
 async function request(path, { method = 'GET', body } = {}) {
   await keycloak.updateToken(30)

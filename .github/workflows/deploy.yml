@@ -1,0 +1,83 @@
+# CI/CD — deploy to the Ubuntu VM over SSH.
+#
+# Trigger: every push to LangGraph-1, plus a manual "Run workflow" button.
+# The job SSHes to the VM, refreshes the checkout, writes services/api/.env from
+# GitHub secrets/variables (NEVER committed, never echoed), and runs the
+# idempotent scripts/deploy_vm.sh which brings up infra + app + nginx.
+#
+# REPO-CLONE DECISION: the VM must already have the repo cloned ONCE manually
+# (private repo, no GitHub token stored on the VM). The pipeline only pulls. If
+# the directory is missing it prints exact clone instructions and fails loudly —
+# see the guard in the script below. (This is the "git pull only" option from the
+# task; the one-time manual clone establishes the VM's git credentials.)
+
+name: deploy
+
+on:
+  push:
+    branches: LangGraph-1
+  workflow_dispatch:
+
+# One deploy at a time; a newer push waits for the in-flight one to finish.
+concurrency:
+  group: deploy-vm
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ vars.VM_HOST }}
+          username: ${{ vars.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          # VM_HOST (a non-secret var) is injected via the inline `export` below.
+          # Secrets are consumed only inside the heredoc and masked by GitHub logs.
+          command_timeout: "30m"
+          script: |
+            set -euo pipefail
+            export VM_HOST="${{ vars.VM_HOST }}"
+            APP_DIR="$HOME/LangGraph_Durable_Workflow_Engine"
+
+            # --- repo presence guard (clone once manually; pipeline only pulls) ---
+            if [ ! -d "$APP_DIR/.git" ]; then
+              echo "ERROR: $APP_DIR is not a git checkout."
+              echo "Clone it ONCE on the VM (establishes git credentials for this private repo), then re-run this deploy:"
+              echo "  git clone https://github.com/sharpmindlabs/LangGraph_Durable_Workflow_Engine.git \"$APP_DIR\""
+              exit 1
+            fi
+
+            cd "$APP_DIR"
+            git fetch origin LangGraph-1
+            git checkout LangGraph-1
+            git pull --ff-only origin LangGraph-1
+
+            # --- write services/api/.env (backend/runtime config; not committed) ---
+            # Heredoc is quoted-free so the ${{ }} values are substituted by Actions
+            # BEFORE reaching the VM; GitHub masks secrets in the run log.
+            mkdir -p services/api
+            cat > services/api/.env <<'ENVEOF'
+            GMAIL_ADDRESS=${{ vars.GMAIL_ADDRESS }}
+            GMAIL_APP_PASSWORD=${{ secrets.GMAIL_APP_PASSWORD }}
+            NOTIFY_TO=${{ vars.NOTIFY_TO }}
+            IMAP_HOST=imap.gmail.com
+            SMTP_HOST=smtp.gmail.com
+            SMTP_PORT=587
+            API_BASE_URL=http://localhost:8000
+            LLM_MODEL=llama3.1:8b
+            LLM_BASE_URL=http://localhost:11434/v1
+            LLM_MAX_CONCURRENCY=100
+            DATABASE_URL=postgresql+psycopg://app:app@localhost:5432/workflow_app
+            TEMPORAL_ADDRESS=localhost:7233
+            KEYCLOAK_URL=http://localhost:8081
+            KEYCLOAK_REALM=workflow
+            KEYCLOAK_ADMIN=admin
+            KEYCLOAK_ADMIN_PASSWORD=admin
+            ENVEOF
+            chmod 600 services/api/.env
+            echo "Wrote services/api/.env ($(wc -l < services/api/.env) lines)"
+
+            # --- run the idempotent deploy on the VM ---
+            bash scripts/deploy_vm.sh
