@@ -170,7 +170,10 @@ def _process_new_invoice(msg, api_base_url: str) -> str:
             timeout=60,
         ).json()
     except Exception as exc:
-        return f"error: extract failed: {exc}"
+        # Extraction is BEST-EFFORT: on failure/timeout still create the invoice
+        # (vendor from sender) so the workflow's request_info can gather fields.
+        print(f"new-invoice: extract failed, creating anyway: {exc}")
+        extracted = {}
 
     data = {key: value for key, value in (extracted.get("fields") or {}).items() if value is not None}
     data.setdefault("vendor", vendor_user)  # fall back to the matched vendor

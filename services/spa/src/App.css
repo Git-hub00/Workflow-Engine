@@ -575,6 +575,61 @@
   display: none;
 }
 
+/* Monitor: clickable KPI filter boxes + pagination; reject-reason form. */
+button.kpi-card {
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.kpi-card.kpi-selected {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(47, 91, 191, 0.18);
+}
+
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
+}
+
+.reject-reason-form {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.reject-reason-form label {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 0.82rem;
+  font-weight: 750;
+}
+
+.reject-reason-form input {
+  min-width: 240px;
+  padding: 7px 10px;
+  color: var(--ink);
+  background: white;
+  border: 1px solid #c7cfda;
+  border-radius: 8px;
+}
+
+.narrative-line {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.narrative-line time {
+  font-weight: 700;
+  color: var(--muted);
+}
+
 .email-note {
   margin: 16px 0 0;
   padding: 11px 13px;

@@ -48,9 +48,13 @@ def _llm_rationale(data, cfg, route, missing, anomalies):
         # model/base_url are env-configurable so swapping to a more advanced
         # model or a remote server needs no code change — just set LLM_MODEL and
         # LLM_BASE_URL.
+        # timeout (env LLM_TIMEOUT, seconds) bounds the rationale call so a slow /
+        # cold model can never stall the activity; the except below then returns
+        # the deterministic fallback rationale. Model-agnostic: purely env-tuned.
         llm = ChatOpenAI(base_url=os.getenv("LLM_BASE_URL", "http://localhost:11434/v1"),
                          api_key="ollama",
-                         model=os.getenv("LLM_MODEL", "llama3.2:1b"), temperature=0)
+                         model=os.getenv("LLM_MODEL", "llama3.2:1b"), temperature=0,
+                         timeout=float(os.getenv("LLM_TIMEOUT", "60")))
         prompt = (f"Invoice from {data['vendor']} for ${data['amount']}. "
                   f"Missing: {missing}. Anomalies: {anomalies}. Chosen route: {route}. "
                   f"In one sentence, explain why this route is appropriate.")

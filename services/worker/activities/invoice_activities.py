@@ -350,21 +350,10 @@ async def create_human_task(txn_id: str, node_id: str, role: str, policy: dict |
 # hiccup, or missing config, must never fail the activity/workflow. The
 # "[invoice-<txn_id>]" subject tag is what lets a reply be correlated back to
 # this run by the email adapter (Section 9.3).
-def _vendor_email_for_txn(txn_id: str) -> str | None:
-    # For a request_info step, resolve the submitting vendor's Keycloak email.
-    # Returns None (caller falls back to NOTIFY_TO) for a non-request_info step, a
-    # null submitted_by, a missing email, or any Keycloak error. No workflow-arg
-    # plumbing needed: everything is derived from txn_id.
+def _submitted_by_email(txn_id: str) -> str | None:
+    # Resolve the SUBMITTING vendor's Keycloak email from transaction.submitted_by.
+    # Returns None on null submitted_by / missing email / any Keycloak error.
     with engine.connect() as conn:
-        node = conn.execute(
-            text(
-                "SELECT node_id FROM task WHERE transaction_id = CAST(:t AS uuid) "
-                "AND status = 'open' ORDER BY created_at DESC LIMIT 1"
-            ),
-            {"t": txn_id},
-        ).scalar_one_or_none()
-        if node != "request_info":
-            return None
         submitted_by = conn.execute(
             text('SELECT submitted_by FROM "transaction" WHERE id = CAST(:t AS uuid)'),
             {"t": txn_id},
@@ -400,13 +389,61 @@ def _vendor_email_for_txn(txn_id: str) -> str | None:
     return None
 
 
+def _vendor_email_for_txn(txn_id: str) -> str | None:
+    # For a request_info step only: target the submitting vendor. Other steps
+    # return None so the caller falls back to NOTIFY_TO.
+    with engine.connect() as conn:
+        node = conn.execute(
+            text(
+                "SELECT node_id FROM task WHERE transaction_id = CAST(:t AS uuid) "
+                "AND status = 'open' ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"t": txn_id},
+        ).scalar_one_or_none()
+    if node != "request_info":
+        return None
+    return _submitted_by_email(txn_id)
+
+
+def _latest_reject_reason(txn_id: str) -> str | None:
+    # Most recent reject decision's reason (manager HUMAN_DECISION or FINANCE_VOTE)
+    # from the immutable event log — no workflow-arg plumbing needed.
+    with engine.connect() as conn:
+        return conn.execute(
+            text(
+                "SELECT payload->>'reason' FROM event "
+                "WHERE transaction_id = CAST(:t AS uuid) "
+                "AND type IN ('HUMAN_DECISION','FINANCE_VOTE') "
+                "AND payload->>'decision' = 'reject' "
+                "ORDER BY occurred_at DESC LIMIT 1"
+            ),
+            {"t": txn_id},
+        ).scalar_one_or_none()
+
+
 @activity.defn
 async def notify(txn_id: str, channel: str, message: str) -> None:
-    # 1. Durable audit write (unchanged) — the source of truth. append_event
-    #    without conn opens its own transaction, which is atomic on its own.
+    # Terminal rejection notice goes to the SUBMITTING VENDOR and carries the
+    # rejecting person's reason (read from the event log). The workflow still
+    # calls notify(txn_id, "email", "Invoice rejected") — signature unchanged.
+    is_rejection = message == "Invoice rejected"
+    reason = _latest_reject_reason(txn_id) if is_rejection else None
+    recipient = None
+    if channel == "email":
+        if is_rejection:
+            recipient = _submitted_by_email(txn_id) or os.getenv("NOTIFY_TO")
+        else:
+            # request_info notifications target the submitting vendor; everything
+            # else (and any resolution failure) falls back to NOTIFY_TO.
+            recipient = _vendor_email_for_txn(txn_id) or os.getenv("NOTIFY_TO")
+
+    # 1. Durable audit write — the source of truth. Records recipient (+ reason
+    #    for rejections) so the audit shows who was told what.
     await append_event(
         txn_id, "notify", "NOTIFY", "NotificationService",
-        f"{channel}: {message}", idempotency_key=None,
+        f"{channel}: {message}",
+        payload={k: v for k, v in {"recipient": recipient, "reason": reason}.items() if v},
+        idempotency_key=None,
     )
 
     # 2. Best-effort REAL send, only for the email channel.
@@ -417,10 +454,6 @@ async def notify(txn_id: str, channel: str, message: str) -> None:
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
     gmail_address = os.getenv("GMAIL_ADDRESS")
     gmail_app_password = os.getenv("GMAIL_APP_PASSWORD")
-    notify_to = os.getenv("NOTIFY_TO")
-    # request_info notifications target the SUBMITTING vendor's Keycloak email;
-    # everything else (and any resolution failure) falls back to NOTIFY_TO.
-    recipient = _vendor_email_for_txn(txn_id) or notify_to
 
     # If SMTP isn't fully configured, skip sending — the audit event already
     # succeeded, so this is not an error.
@@ -433,10 +466,11 @@ async def notify(txn_id: str, channel: str, message: str) -> None:
     msg["Subject"] = f"[invoice-{txn_id}] {message}"
     msg["From"] = gmail_address
     msg["To"] = recipient
-    msg.set_content(
-        f"{message}\n\n"
-        "Reply to this email with one of: approve / reject / return."
-    )
+    if is_rejection:
+        body = f"Your invoice was rejected.\n\nReason: {reason or 'No reason was recorded.'}"
+    else:
+        body = f"{message}\n\nReply to this email with one of: approve / reject / return."
+    msg.set_content(body)
 
     try:
         with smtplib.SMTP(smtp_host, smtp_port) as server:

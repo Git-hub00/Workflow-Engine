@@ -95,7 +95,9 @@ function TaskInbox({ roles, username }) {
   const [tasks, setTasks] = useState([])
   const [details, setDetails] = useState({})
   const [onlyMyRoles, setOnlyMyRoles] = useState(true)
-  const [decisions, setDecisions] = useState({})
+  // rejectDrafts[token] !== undefined => the required-reason reject form is open
+  // for that task; its value is the typed reason text.
+  const [rejectDrafts, setRejectDrafts] = useState({})
   const [feedback, setFeedback] = useState({})
   const [busyAction, setBusyAction] = useState('')
   const [loading, setLoading] = useState(true)
@@ -214,10 +216,11 @@ function TaskInbox({ roles, username }) {
     }
   }
 
-  async function completeTask(task, decisionArg) {
-    // decisionArg lets the finance Approve/Reject buttons pass the decision
-    // directly; the manager card still relies on its dropdown (decisions state).
-    const decision = decisionArg || decisions[task.token] || 'approve'
+  async function completeTask(task, decisionArg, reason) {
+    // decisionArg comes from the Approve/Reject buttons; `reason` is REQUIRED by
+    // the UI for rejections and travels in the payload so it lands in the audit
+    // event (HUMAN_DECISION / FINANCE_VOTE) and the vendor rejection email.
+    const decision = decisionArg || 'approve'
     const isFinanceTask = task.node_id === 'finance'
     setBusyAction(`${task.token}:complete`)
     setFeedback((current) => ({ ...current, [task.token]: null }))
@@ -225,8 +228,13 @@ function TaskInbox({ roles, username }) {
     try {
       const result = await post(`/v1/tasks/${encodeURIComponent(task.token)}/complete`, {
         idempotency_key: crypto.randomUUID(),
-        payload: { decision },
+        payload: { decision, ...(reason ? { reason } : {}) },
         kind: isFinanceTask ? 'finance' : 'human',
+      })
+      setRejectDrafts((current) => {
+        const next = { ...current }
+        delete next[task.token]
+        return next
       })
       if (isFinanceTask) {
         await loadTasks(false)
@@ -378,24 +386,75 @@ function TaskInbox({ roles, username }) {
                       open until the quorum is decided.
                     </p>
                   ) : task.current_user_claimed ? (
-                    <div className="finance-vote-buttons">
-                      <button
-                        className="primary-button"
-                        type="button"
-                        onClick={() => completeTask(task, 'approve')}
-                        disabled={!canSubmitFinanceDecision || busyAction === `${task.token}:complete`}
+                    rejectDrafts[task.token] === undefined ? (
+                      <div className="finance-vote-buttons">
+                        <button
+                          className="primary-button"
+                          type="button"
+                          onClick={() => completeTask(task, 'approve')}
+                          disabled={!canSubmitFinanceDecision || busyAction === `${task.token}:complete`}
+                        >
+                          {busyAction === `${task.token}:complete` ? 'Submitting…' : 'Approve'}
+                        </button>
+                        <button
+                          className="danger-button"
+                          type="button"
+                          onClick={() =>
+                            setRejectDrafts((current) => ({ ...current, [task.token]: '' }))
+                          }
+                          disabled={!canSubmitFinanceDecision || busyAction === `${task.token}:complete`}
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    ) : (
+                      <form
+                        className="reject-reason-form"
+                        onSubmit={(event) => {
+                          event.preventDefault()
+                          completeTask(task, 'reject', rejectDrafts[task.token].trim())
+                        }}
                       >
-                        {busyAction === `${task.token}:complete` ? 'Submitting…' : 'Approve'}
-                      </button>
-                      <button
-                        className="danger-button"
-                        type="button"
-                        onClick={() => completeTask(task, 'reject')}
-                        disabled={!canSubmitFinanceDecision || busyAction === `${task.token}:complete`}
-                      >
-                        Reject
-                      </button>
-                    </div>
+                        <label>
+                          Rejection reason
+                          <input
+                            type="text"
+                            required
+                            placeholder="Why is this invoice rejected?"
+                            value={rejectDrafts[task.token]}
+                            onChange={(event) =>
+                              setRejectDrafts((current) => ({
+                                ...current,
+                                [task.token]: event.target.value,
+                              }))
+                            }
+                          />
+                        </label>
+                        <button
+                          className="danger-button"
+                          type="submit"
+                          disabled={
+                            !rejectDrafts[task.token].trim() ||
+                            busyAction === `${task.token}:complete`
+                          }
+                        >
+                          {busyAction === `${task.token}:complete` ? 'Submitting…' : 'Confirm reject'}
+                        </button>
+                        <button
+                          className="secondary-button"
+                          type="button"
+                          onClick={() =>
+                            setRejectDrafts((current) => {
+                              const next = { ...current }
+                              delete next[task.token]
+                              return next
+                            })
+                          }
+                        >
+                          Cancel
+                        </button>
+                      </form>
+                    )
                   ) : task.can_claim ? (
                     <button
                       className="secondary-button finance-claim-button"
@@ -403,7 +462,7 @@ function TaskInbox({ roles, username }) {
                       onClick={() => claimTask(task)}
                       disabled={busyAction === `${task.token}:claim`}
                     >
-                      {busyAction === `${task.token}:claim` ? 'Claiming…' : 'Claim a finance slot to vote'}
+                      {busyAction === `${task.token}:claim` ? 'Claiming…' : 'Claim'}
                     </button>
                   ) : !financeReady ? (
                     <p className="finance-vote-status">
@@ -429,38 +488,80 @@ function TaskInbox({ roles, username }) {
                     {busyAction === `${task.token}:claim` ? 'Claiming…' : 'Claim'}
                   </button>
 
-                  <form
-                    className="complete-form"
-                    onSubmit={(event) => {
-                      event.preventDefault()
-                      completeTask(task)
-                    }}
-                  >
-                    <label>
-                      Decision
-                      <select
-                        value={decisions[task.token] || 'approve'}
-                        onChange={(event) =>
-                          setDecisions((current) => ({
-                            ...current,
-                            [task.token]: event.target.value,
-                          }))
-                        }
-                        disabled={!isClaimedByUser}
+                  {/* After claiming: exactly Approve + Reject. Reject requires a
+                      typed reason (recorded in the audit + vendor email). The
+                      workflow's "return" branch still exists in the backend; it is
+                      intentionally not exposed in this UI. */}
+                  {isClaimedByUser &&
+                    (rejectDrafts[task.token] === undefined ? (
+                      <div className="finance-vote-buttons">
+                        <button
+                          className="primary-button"
+                          type="button"
+                          onClick={() => completeTask(task, 'approve')}
+                          disabled={busyAction === `${task.token}:complete`}
+                        >
+                          {busyAction === `${task.token}:complete` ? 'Submitting…' : 'Approve'}
+                        </button>
+                        <button
+                          className="danger-button"
+                          type="button"
+                          onClick={() =>
+                            setRejectDrafts((current) => ({ ...current, [task.token]: '' }))
+                          }
+                          disabled={busyAction === `${task.token}:complete`}
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    ) : (
+                      <form
+                        className="reject-reason-form"
+                        onSubmit={(event) => {
+                          event.preventDefault()
+                          completeTask(task, 'reject', rejectDrafts[task.token].trim())
+                        }}
                       >
-                        <option value="approve">Approve</option>
-                        <option value="reject">Reject</option>
-                        <option value="return">Return</option>
-                      </select>
-                    </label>
-                    <button
-                      className="primary-button"
-                      type="submit"
-                      disabled={!isClaimedByUser || busyAction === `${task.token}:complete`}
-                    >
-                      {busyAction === `${task.token}:complete` ? 'Submitting…' : 'Complete'}
-                    </button>
-                  </form>
+                        <label>
+                          Rejection reason
+                          <input
+                            type="text"
+                            required
+                            placeholder="Why is this invoice rejected?"
+                            value={rejectDrafts[task.token]}
+                            onChange={(event) =>
+                              setRejectDrafts((current) => ({
+                                ...current,
+                                [task.token]: event.target.value,
+                              }))
+                            }
+                          />
+                        </label>
+                        <button
+                          className="danger-button"
+                          type="submit"
+                          disabled={
+                            !rejectDrafts[task.token].trim() ||
+                            busyAction === `${task.token}:complete`
+                          }
+                        >
+                          {busyAction === `${task.token}:complete` ? 'Submitting…' : 'Confirm reject'}
+                        </button>
+                        <button
+                          className="secondary-button"
+                          type="button"
+                          onClick={() =>
+                            setRejectDrafts((current) => {
+                              const next = { ...current }
+                              delete next[task.token]
+                              return next
+                            })
+                          }
+                        >
+                          Cancel
+                        </button>
+                      </form>
+                    ))}
                 </div>
               )}
 
@@ -481,8 +582,14 @@ function TaskInbox({ roles, username }) {
   )
 }
 
+const PAGE_SIZE = 10
+
 function Monitor() {
   const [transactions, setTransactions] = useState([])
+  const [stats, setStats] = useState(null)
+  // KPI filter ('total' = all) + 1-based page within that filter.
+  const [filter, setFilter] = useState('total')
+  const [page, setPage] = useState(1)
   const [selected, setSelected] = useState(null)
   const [history, setHistory] = useState([])
   const [loading, setLoading] = useState(true)
@@ -499,9 +606,14 @@ function Monitor() {
       polling = true
 
       try {
-        const rows = await get('/v1/transactions')
+        const statusParam = filter === 'total' ? '' : `&status=${encodeURIComponent(filter)}`
+        const [rows, counts] = await Promise.all([
+          get(`/v1/transactions?limit=${PAGE_SIZE}&offset=${(page - 1) * PAGE_SIZE}${statusParam}`),
+          get('/v1/transactions/stats'),
+        ])
         if (active) {
           setTransactions(rows)
+          setStats(counts)
           setSelected((current) => (
             current ? rows.find((transaction) => transaction.id === current.id) || current : null
           ))
@@ -521,7 +633,7 @@ function Monitor() {
       active = false
       window.clearInterval(timer)
     }
-  }, [])
+  }, [filter, page])
 
   const displayTransactions = useMemo(
     () => transactions.map((transaction) => ({
@@ -531,20 +643,17 @@ function Monitor() {
     [transactions],
   )
 
-  const monitorCounts = useMemo(() => {
-    const counts = {
-      total: displayTransactions.length,
-      running: 0,
-      approved: 0,
-      rejected: 0,
-    }
-    for (const transaction of displayTransactions) {
-      if (Object.hasOwn(counts, transaction.status) && transaction.status !== 'total') {
-        counts[transaction.status] += 1
-      }
-    }
-    return counts
-  }, [displayTransactions])
+  // Counts come from /v1/transactions/stats: they reflect ALL transactions,
+  // not just the visible page.
+  const monitorCounts = stats || { total: 0, running: 0, approved: 0, rejected: 0 }
+  const totalForFilter = monitorCounts[filter] ?? 0
+  const totalPages = Math.max(1, Math.ceil(totalForFilter / PAGE_SIZE))
+
+  function selectKpi(key) {
+    setFilter(key)
+    setPage(1)
+    setSelected(null)
+  }
 
   async function selectTransaction(transaction) {
     setSelected(transaction)
@@ -553,7 +662,11 @@ function Monitor() {
     setHistoryLoading(true)
 
     try {
-      const events = await get(`/v1/transactions/${encodeURIComponent(transaction.id)}/history`)
+      // AI-narrated audit: one clean sentence per event (the backend falls back
+      // to deterministic text when the LLM is slow/unavailable — never raw JSON).
+      const events = await get(
+        `/v1/transactions/${encodeURIComponent(transaction.id)}/history?format=narrative`,
+      )
       setHistory(events)
     } catch (requestError) {
       setHistoryError(apiErrorMessage(requestError))
@@ -580,10 +693,16 @@ function Monitor() {
         <>
           <div className="kpi-grid">
             {monitorKpis.map((kpi) => (
-              <article className={`kpi-card kpi-card-${kpi.key}`} key={kpi.key}>
+              <button
+                className={`kpi-card kpi-card-${kpi.key} ${filter === kpi.key ? 'kpi-selected' : ''}`}
+                type="button"
+                key={kpi.key}
+                onClick={() => selectKpi(kpi.key)}
+                aria-pressed={filter === kpi.key}
+              >
                 <span>{kpi.label}</span>
                 <strong>{monitorCounts[kpi.key]}</strong>
-              </article>
+              </button>
             ))}
           </div>
 
@@ -618,6 +737,25 @@ function Monitor() {
                 </tbody>
               </table>
               {displayTransactions.length === 0 && <p className="table-empty">No transactions have been recorded.</p>}
+            </div>
+            <div className="pagination">
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setPage((current) => Math.max(1, current - 1))}
+                disabled={page <= 1}
+              >
+                Previous
+              </button>
+              <span className="muted">Page {page} of {totalPages}</span>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setPage((current) => Math.min(totalPages, current + 1))}
+                disabled={page >= totalPages}
+              >
+                Next
+              </button>
             </div>
           </div>
         </>
@@ -669,13 +807,11 @@ function Monitor() {
               <li key={`${event.occurred_at}-${event.type}-${index}`}>
                 <span className="timeline-dot" />
                 <div className="timeline-card">
-                  <div className="timeline-header">
-                    <strong>{event.type}</strong>
+                  <p className="narrative-line">
                     <time>{formatDate(event.occurred_at)}</time>
-                  </div>
-                  <p className="event-actor">Actor: {event.actor || '—'}</p>
-                  {event.detail && <p>{event.detail}</p>}
-                  <pre>{pretty(event.payload)}</pre>
+                    {' — '}
+                    {event.text}
+                  </p>
                 </div>
               </li>
             ))}

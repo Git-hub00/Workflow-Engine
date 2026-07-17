@@ -10,5 +10,5 @@
     "slaHours": 48,
     "approvedVendors": ["Acme Supplies", "Globex Inc", "Initech", "Northwind Traders"]
   },
-  "roles": { "review": "ap_clerk", "manager": "ap_manager", "finance": "finance" }
+  "roles": { "review": "vendor", "manager": "ap_manager", "finance": "finance" }
 }

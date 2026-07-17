@@ -66,21 +66,21 @@ async def main():
         activity_executor=ThreadPoolExecutor(max_workers=8),
     )
 
-    # Worker 2 — the LLM queue. Hosts ONLY ai_review, with tightly limited
-    # concurrency so the local 1b model is never asked to serve more than 2
-    # requests at once, regardless of how many invoices are running.
-    # Default 2 is safe for the local 1b model on limited memory; set
-    # LLM_MAX_CONCURRENCY higher (env var, no code change) when moving to a more
-    # powerful model/server.
+    # Worker 2 — the LLM queue. Hosts ONLY ai_review on its own queue so LLM work
+    # stays isolated from the cheap DB/notify activities. Concurrency is
+    # env-tunable via LLM_MAX_CONCURRENCY; the DEFAULT is effectively unthrottled
+    # (100) so invoices are not serialized 2-at-a-time. Lower it via the env var
+    # if a memory-constrained local model needs protecting — no code change.
+    llm_concurrency = int(os.getenv("LLM_MAX_CONCURRENCY", "100"))
     worker_llm = Worker(
         client,
         task_queue="llm-tq",
         activities=[ai_review],
-        activity_executor=ThreadPoolExecutor(max_workers=int(os.getenv("LLM_MAX_CONCURRENCY", "2"))),
-        max_concurrent_activities=int(os.getenv("LLM_MAX_CONCURRENCY", "2")),
+        activity_executor=ThreadPoolExecutor(max_workers=llm_concurrency),
+        max_concurrent_activities=llm_concurrency,
     )
 
-    print("Workers started: invoice-tq (main) + llm-tq (LLM, max 2 concurrent). Ctrl+C to stop.")
+    print(f"Workers started: invoice-tq (main) + llm-tq (LLM, max {llm_concurrency} concurrent). Ctrl+C to stop.")
 
     # Run both workers concurrently; each polls its own queue forever.
     await asyncio.gather(worker_main.run(), worker_llm.run())

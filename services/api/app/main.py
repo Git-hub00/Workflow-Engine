@@ -106,7 +106,7 @@ async def current_user(authorization: str | None = Header(default=None)) -> dict
     if os.getenv("AUTH_DISABLED") == "1":
         return {
             "username": "dev-admin",
-            "roles": ["ap_clerk", "ap_manager", "finance", "process_author", "admin"],
+            "roles": ["vendor", "ap_manager", "finance", "process_author", "admin"],
         }
 
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -336,13 +336,20 @@ async def create_transaction(body: TransactionIn, user: dict | None = Depends(_o
 # vendor can still fill the form by hand.
 @app.post("/v1/extract-invoice")
 async def extract_invoice(file: UploadFile = File(...)):
+    raw = await file.read()
+    # Blocking work (pypdf + LLM HTTP) runs on a thread so a slow model can NEVER
+    # stall the API event loop for other requests.
+    import asyncio
+    return await asyncio.to_thread(_extract_invoice_sync, raw)
+
+
+def _extract_invoice_sync(raw: bytes):
     import io
     import re
     from pypdf import PdfReader
     from openai import OpenAI
 
     try:
-        raw = await file.read()
         reader = PdfReader(io.BytesIO(raw))
         text_content = "\n".join((page.extract_text() or "") for page in reader.pages)
     except Exception as exc:
@@ -355,6 +362,7 @@ async def extract_invoice(file: UploadFile = File(...)):
         client = OpenAI(
             base_url=os.getenv("LLM_BASE_URL", "http://localhost:11434/v1"),
             api_key="ollama",
+            timeout=45,  # never hang on a slow/cold 1b model; falls to {fields:{}, error}
         )
         completion = client.chat.completions.create(
             model=os.getenv("LLM_MODEL", "llama3.2:1b"),
@@ -785,6 +793,9 @@ class CompleteIn(BaseModel):
 
 async def _complete_finance_task(token: str, body: CompleteIn, user: dict) -> dict:
     decision = body.payload.get("decision")
+    # Rejection reason travels with the vote so the audit (FINANCE_VOTE event) and
+    # the terminal vendor rejection email can surface WHO rejected and WHY.
+    reason = body.payload.get("reason")
     if decision not in {"approve", "reject"}:
         raise HTTPException(
             status_code=422,
@@ -840,7 +851,9 @@ async def _complete_finance_task(token: str, body: CompleteIn, user: dict) -> di
                 ),
                 {
                     "id": str(participant["id"]),
-                    "decision": json.dumps({"decision": decision}),
+                    "decision": json.dumps(
+                        {"decision": decision, **({"reason": reason} if reason else {})}
+                    ),
                 },
             )
 
@@ -876,6 +889,7 @@ async def _complete_finance_task(token: str, body: CompleteIn, user: dict) -> di
                 "participant": user["username"],
                 "participant_id": str(participant["id"]),
                 "decision": decision,
+                **({"reason": reason} if reason else {}),
             }
             conn.execute(
                 text(
@@ -1065,10 +1079,31 @@ async def put_config(process_key: str, body: ConfigIn, user: dict = Depends(requ
 # ===========================================================================
 
 
-# WHY GET /v1/transactions: the dashboard's "recent runs" list — the 100 most
-# recent transactions with their current status and the invoice snapshot.
+# WHY GET /v1/transactions/stats: per-status counts across ALL transactions so
+# the Monitor's KPI boxes reflect the full dataset, not just the current page.
+@app.get("/v1/transactions/stats")
+async def transaction_stats():
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text('SELECT status, count(*) AS n FROM "transaction" GROUP BY status')
+        ).mappings().all()
+    counts = {r["status"]: r["n"] for r in rows}
+    return {
+        "total": sum(counts.values()),
+        "running": counts.get("running", 0),
+        "approved": counts.get("approved", 0),
+        "rejected": counts.get("rejected", 0),
+    }
+
+
+# WHY GET /v1/transactions: the dashboard's "recent runs" list. Optional
+# status/limit/offset keep the RESPONSE SHAPE (a JSON array) backward compatible
+# for existing callers (vendor inbox, email adapter) while enabling the Monitor's
+# pagination + KPI filtering.
 @app.get("/v1/transactions")
-async def list_transactions():
+async def list_transactions(status: str | None = None, limit: int = 100, offset: int = 0):
+    limit = max(1, min(int(limit), 100))
+    offset = max(0, int(offset))
     with engine.connect() as conn:
         rows = conn.execute(
             text(
@@ -1081,8 +1116,10 @@ async def list_transactions():
                 'FROM "transaction" tr '
                 "LEFT JOIN definition_version dv ON dv.id = tr.definition_version_id "
                 "LEFT JOIN process_definition pd ON pd.id = dv.definition_id "
-                "ORDER BY tr.created_at DESC, tr.id DESC LIMIT 100"
-            )
+                "WHERE (CAST(:status AS text) IS NULL OR tr.status = CAST(:status AS text)) "
+                "ORDER BY tr.created_at DESC, tr.id DESC LIMIT :limit OFFSET :offset"
+            ),
+            {"status": status, "limit": limit, "offset": offset},
         ).mappings().all()
     # Stringify uuid/timestamp so the payload is JSON-serializable; data_snapshot
     # is jsonb and already deserializes to a dict.
@@ -1110,7 +1147,7 @@ async def list_transactions():
 # in order — the timeline a monitor UI shows (started -> LLM decision -> task ->
 # notify -> ... -> outcome).
 @app.get("/v1/transactions/{txn_id}/history")
-async def transaction_history(txn_id: str):
+async def transaction_history(txn_id: str, format: str | None = None):
     with engine.connect() as conn:
         # 404 rather than returning an empty list for a txn that doesn't exist.
         exists = conn.execute(
@@ -1142,4 +1179,129 @@ async def transaction_history(txn_id: str):
                 "detail": detail,
             }
         )
+    if format == "narrative":
+        # LLM refinement is blocking HTTP — run on a thread so a slow model never
+        # stalls the API event loop.
+        import asyncio
+        return await asyncio.to_thread(_narrate_events, txn_id, out)
     return out
+
+
+# ---------------------------------------------------------------------------
+# AI-narrated audit (Monitor drill-down). Deterministic per-event formatter is
+# the SOURCE OF TRUTH fallback; an LLM pass (same env-configured Ollama client
+# as ai_review: LLM_BASE_URL / LLM_MODEL, bounded by NARRATE_TIMEOUT) may refine
+# the sentences. The Monitor must NEVER see raw JSON or hang on a slow model.
+# ---------------------------------------------------------------------------
+
+_ROUTE_TEXT = {
+    "AUTO_APPROVE": "automatic approval",
+    "REQUEST_INFO": "a request for missing information",
+    "MANAGER_ONLY": "manager approval",
+    "MANAGER_THEN_FINANCE": "manager approval followed by a finance quorum",
+}
+
+# In-memory narrative cache keyed by (txn_id, event_count, last_timestamp): a
+# repeat view of an unchanged history never re-calls the LLM. (In-memory chosen
+# over a DB table: narratives are cheap to regenerate and per-process caching is
+# enough for the single-API dev topology; swap for a table if scaled out.)
+_NARRATIVE_CACHE: dict = {}
+
+
+def _fallback_sentence(event: dict) -> str:
+    # Deterministic, code-built plain-English sentence for one audit event.
+    etype = event.get("type")
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    if etype == "WORKFLOW_RUNNING":
+        return "The invoice workflow started."
+    if etype == "LLM_DECISION":
+        route = _ROUTE_TEXT.get(payload.get("route"), payload.get("route") or "review")
+        missing = payload.get("missing") or []
+        extra = f" (missing: {', '.join(missing)})" if missing else ""
+        return f"The AI reviewed the invoice and routed it to {route}{extra}."
+    if etype == "TASK_CREATED":
+        role = payload.get("role") or "a user"
+        node = payload.get("node_id") or "a step"
+        return f"A human task for role '{role}' was created at the '{node}' step."
+    if etype == "NOTIFY":
+        recipient = payload.get("recipient")
+        base = "A notification email was sent" + (f" to {recipient}" if recipient else "")
+        reason = payload.get("reason")
+        detail = event.get("detail") or ""
+        what = detail.split(":", 1)[1].strip() if ":" in detail else detail
+        return f"{base}: {what}." + (f" Reason: {reason}." if reason else "")
+    if etype == "HUMAN_DECISION":
+        decision = payload.get("decision")
+        if decision == "resubmit":
+            fields = ", ".join((payload.get("data") or {}).keys()) or "the requested details"
+            return f"The vendor supplied the requested information ({fields})."
+        reason = payload.get("reason")
+        return f"A reviewer decided to {decision or 'act'}." + (f" Reason: {reason}." if reason else "")
+    if etype == "FINANCE_VOTE":
+        who = payload.get("participant") or "A finance member"
+        decision = payload.get("decision") or "vote"
+        reason = payload.get("reason")
+        return f"Finance member {who} voted to {decision}." + (f" Reason: {reason}." if reason else "")
+    if etype == "ERP_POSTED":
+        return "The approved invoice was posted to the ERP system."
+    return f"{etype or 'An'} event was recorded."
+
+
+def _narrate_events(txn_id: str, events: list) -> list:
+    if not events:
+        return []
+    cache_key = (txn_id, len(events), events[-1]["occurred_at"])
+    cached = _NARRATIVE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    fallback = [_fallback_sentence(e) for e in events]
+    sentences = fallback
+    try:
+        # ONE bounded LLM call for the whole history (model-agnostic: strict JSON
+        # contract, no model-specific parsing). Any failure -> deterministic text.
+        import re as _re
+        from openai import OpenAI
+
+        client = OpenAI(
+            base_url=os.getenv("LLM_BASE_URL", "http://localhost:11434/v1"),
+            api_key="ollama",
+            timeout=float(os.getenv("NARRATE_TIMEOUT", "30")),
+        )
+        brief = [
+            {"type": e["type"], "detail": e.get("detail"), "payload": e.get("payload")}
+            for e in events
+        ]
+        completion = client.chat.completions.create(
+            model=os.getenv("LLM_MODEL", "llama3.2:1b"),
+            temperature=0,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Rewrite each workflow audit event below as ONE clear, concise, "
+                    "past-tense sentence for a business user. Return ONLY a JSON array "
+                    f"of exactly {len(brief)} strings, in the same order.\n\n"
+                    f"Events: {json.dumps(brief, default=str)[:6000]}\n\n"
+                    f"Draft sentences you may improve: {json.dumps(fallback)}"
+                ),
+            }],
+        )
+        content = completion.choices[0].message.content or ""
+        cleaned = _re.sub(r"^```(?:json)?|```$", "", content.strip(), flags=_re.MULTILINE).strip()
+        match = _re.search(r"\[.*\]", cleaned, _re.DOTALL)
+        parsed = json.loads(match.group(0) if match else cleaned)
+        if (
+            isinstance(parsed, list)
+            and len(parsed) == len(events)
+            and all(isinstance(s, str) and s.strip() for s in parsed)
+        ):
+            sentences = [s.strip() for s in parsed]
+    except Exception as exc:
+        print(f"narrate: LLM unavailable, using deterministic text: {exc}")
+
+    result = [
+        {"occurred_at": e["occurred_at"], "type": e["type"], "text": s}
+        for e, s in zip(events, sentences)
+    ]
+    _NARRATIVE_CACHE[cache_key] = result
+    return result
