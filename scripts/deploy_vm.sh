@@ -6,16 +6,28 @@
 #
 # Prereqs already on the VM: docker, docker compose, uv, node20/npm, git, nginx,
 # and a sudo-capable user. The repo must already be cloned (the pipeline pulls).
-set -euo pipefail
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+set -Eeuo pipefail
+trap 'rc=$?; echo "DEPLOY FAILED at line ${LINENO}: ${BASH_COMMAND} (exit ${rc})" >&2' ERR
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$APP_DIR"
 # Absolute -f so compose works regardless of the current directory (we cd around).
-COMPOSE="docker compose -f $APP_DIR/docker-compose.dev.yml"
+COMPOSE=(sudo docker compose -f "$APP_DIR/docker-compose.dev.yml")
 RUN_USER="$(whoami)"
-UV_BIN="$(command -v uv)"
+UV_BIN="$HOME/.local/bin/uv"
 VM_HOST="${VM_HOST:-localhost}"     # exported by the pipeline; defaults for manual runs
 echo "==> deploy_vm.sh  APP_DIR=$APP_DIR  USER=$RUN_USER  VM_HOST=$VM_HOST  uv=$UV_BIN"
+
+# Fail early with a useful message if the non-interactive SSH environment cannot
+# resolve a required host tool. `sudo docker` avoids relying on a freshly applied
+# docker-group membership in the CI SSH session.
+[ -x "$UV_BIN" ] || { echo "ERROR: uv is not executable at $UV_BIN" >&2; exit 1; }
+required_tools=(cat chmod cp curl dirname docker git grep ln mkdir nginx node npm rm seq sleep sudo systemctl tee wc whoami)
+for tool in "${required_tools[@]}"; do
+  command -v "$tool" >/dev/null || { echo "ERROR: required tool '$tool' is not on PATH=$PATH" >&2; exit 1; }
+done
+sudo docker compose version >/dev/null
 
 # --- 1. refresh checkout (idempotent; pipeline already pulled, kept for hand-runs)
 git fetch origin LangGraph-1
@@ -23,13 +35,13 @@ git checkout LangGraph-1
 git pull --ff-only origin LangGraph-1
 
 # --- 2. infra up
-$COMPOSE up -d
+"${COMPOSE[@]}" up -d
 echo "==> compose services requested"
 
 # --- 3. wait for Postgres + Keycloak (timeout ~180s each)
 echo "==> waiting for Postgres..."
 for i in $(seq 1 60); do
-  if $COMPOSE exec -T postgres pg_isready -U app -d workflow_app >/dev/null 2>&1; then
+  if "${COMPOSE[@]}" exec -T postgres pg_isready -U app -d workflow_app >/dev/null 2>&1; then
     echo "    Postgres ready (${i}x3s)"; break
   fi
   [ "$i" = 60 ] && { echo "ERROR: Postgres not ready after 180s"; exit 1; }
@@ -45,26 +57,26 @@ for i in $(seq 1 60); do
 done
 
 # --- 4. ensure the LLM model is present (pull once; big download tolerated)
-if $COMPOSE exec -T ollama ollama list | grep -q 'llama3.2:3b'; then
+if "${COMPOSE[@]}" exec -T ollama ollama list | grep -q 'llama3.2:3b'; then
   echo "==> ollama model llama3.2:3b already present"
 else
   echo "==> pulling ollama model llama3.2:3b (first run only)..."
-  $COMPOSE exec -T ollama ollama pull llama3.1:8b
+  "${COMPOSE[@]}" exec -T ollama ollama pull llama3.1:8b
 fi
 
 # --- 5. Python env + DB migrations (from services/api)
 cd "$APP_DIR/services/api"
-[ -d .venv ] || uv venv
-uv pip install -r requirements.txt
-uv run alembic upgrade head
+[ -d .venv ] || "$UV_BIN" venv
+"$UV_BIN" pip install -r requirements.txt
+"$UV_BIN" run alembic upgrade head
 echo "==> migrations applied"
 
 # --- 6. seed the PDD (idempotent) — publishes definitions/invoice.pdd.json
-uv run python ../../scripts/seed_pdd.py
+"$UV_BIN" run python ../../scripts/seed_pdd.py
 
 # belt-and-suspenders: force roles.review = "vendor" on the published version
 # (no-op if the PDD JSON already carries it, which it does).
-$COMPOSE exec -T postgres \
+"${COMPOSE[@]}" exec -T postgres \
   psql -U app -d workflow_app -c \
   "UPDATE definition_version dv SET pdd = jsonb_set(pdd,'{roles,review}','\"vendor\"') FROM process_definition pd WHERE pd.id = dv.definition_id AND pd.process_key = 'invoice_approval';" \
   >/dev/null && echo "==> ensured roles.review=vendor in DB"
@@ -72,7 +84,7 @@ $COMPOSE exec -T postgres \
 # --- 7. seed Keycloak (idempotent). Load KEYCLOAK_* from the written .env and
 #        pass VM_HOST so the SPA client's redirect URIs use the public host.
 set -a; . "$APP_DIR/services/api/.env"; set +a
-VM_HOST="$VM_HOST" uv run python ../../scripts/seed_keycloak.py
+VM_HOST="$VM_HOST" "$UV_BIN" run python ../../scripts/seed_keycloak.py
 
 # --- 8. systemd app services (write units every run -> idempotent + picks up
 #        path changes; then daemon-reload, enable, restart).

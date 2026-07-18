@@ -35,10 +35,9 @@ jobs:
           key: ${{ secrets.VM_SSH_KEY }}
           # VM_HOST (a non-secret var) is injected via the inline `export` below.
           # Secrets are consumed only inside the heredoc and masked by GitHub logs.
-          command_timeout: "30m"
+          command_timeout: "40m"
           script: |
             set -euo pipefail
-            export VM_HOST="${{ vars.VM_HOST }}"
             APP_DIR="$HOME/LangGraph_Durable_Workflow_Engine"
 
             # --- repo presence guard (clone once manually; pipeline only pulls) ---
@@ -80,4 +79,5 @@ jobs:
             echo "Wrote services/api/.env ($(wc -l < services/api/.env) lines)"
 
             # --- run the idempotent deploy on the VM ---
-            bash scripts/deploy_vm.sh
+            echo "Running $HOME/LangGraph_Durable_Workflow_Engine/scripts/deploy_vm.sh"
+            export VM_HOST="${{ vars.VM_HOST }}"; bash "$HOME/LangGraph_Durable_Workflow_Engine/scripts/deploy_vm.sh"
