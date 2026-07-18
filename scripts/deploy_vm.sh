@@ -12,18 +12,20 @@ trap 'rc=$?; echo "DEPLOY FAILED at line ${LINENO}: ${BASH_COMMAND} (exit ${rc})
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$APP_DIR"
-# Absolute -f so compose works regardless of the current directory (we cd around).
-COMPOSE=(sudo docker compose -f "$APP_DIR/docker-compose.dev.yml")
 RUN_USER="$(whoami)"
 UV_BIN="$HOME/.local/bin/uv"
 export VM_HOST="${VM_HOST:-localhost}"  # public Compose/SPA host; defaults for local runs
+# Absolute -f makes Compose independent of later cd calls. Pass VM_HOST through
+# sudo explicitly because sudo's default env_reset would otherwise make Compose
+# resolve ${VM_HOST:-localhost} to localhost on the VM.
+COMPOSE=(sudo env "VM_HOST=$VM_HOST" docker compose -f "$APP_DIR/docker-compose.dev.yml")
 echo "==> deploy_vm.sh  APP_DIR=$APP_DIR  USER=$RUN_USER  VM_HOST=$VM_HOST  uv=$UV_BIN"
 
 # Fail early with a useful message if the non-interactive SSH environment cannot
 # resolve a required host tool. `sudo docker` avoids relying on a freshly applied
 # docker-group membership in the CI SSH session.
 [ -x "$UV_BIN" ] || { echo "ERROR: uv is not executable at $UV_BIN" >&2; exit 1; }
-required_tools=(cat chmod cp curl dirname docker git grep ln mkdir nginx node npm rm seq sleep sudo systemctl tee wc whoami)
+required_tools=(cat chmod cp curl dirname docker env git grep ln mkdir nginx node npm rm seq sleep sudo systemctl tee wc whoami)
 for tool in "${required_tools[@]}"; do
   command -v "$tool" >/dev/null || { echo "ERROR: required tool '$tool' is not on PATH=$PATH" >&2; exit 1; }
 done
