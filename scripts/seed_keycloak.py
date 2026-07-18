@@ -119,7 +119,11 @@ def main() -> int:
         "directAccessGrantsEnabled": True,  # password grant for scripted tests
         "redirectUris": REDIRECT_URIS,
         "webOrigins": WEB_ORIGINS,
-        "attributes": {"pkce.code.challenge.method": "S256"},
+        # PKCE S256 enforcement is disabled: the SPA is served over plain HTTP on a
+        # bare IP (no secure context => no crypto.subtle to compute the S256
+        # challenge). Empty string = do not require PKCE. Restore "S256" once the
+        # SPA is served over HTTPS (see services/spa/src/main.jsx pkceMethod).
+        "attributes": {"pkce.code.challenge.method": ""},
     }
     if existing:
         cid = existing[0]["id"]

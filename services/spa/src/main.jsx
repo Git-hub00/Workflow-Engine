@@ -9,7 +9,12 @@ const rootElement = document.getElementById('root')
 keycloak
   .init({
     onLoad: 'login-required',
-    pkceMethod: 'S256',
+    // PKCE S256 needs the Web Crypto SubtleCrypto API, which browsers only expose
+    // in a secure context (HTTPS or http://localhost). Served over plain HTTP on a
+    // bare IP, crypto.subtle is undefined and login fails with "Web Crypto API is
+    // not available." Disabled here to match this HTTP demo deployment. Re-enable
+    // ('S256') once the app is served over HTTPS.
+    pkceMethod: false,
     checkLoginIframe: false,
   })
   .then(() => {

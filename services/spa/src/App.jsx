@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { get, post, put, upload } from './api'
 import keycloak from './keycloak'
+import { uuid } from './uuid'
 import './App.css'
 
 const PROCESS_KEY = 'invoice_approval'
@@ -227,7 +228,7 @@ function TaskInbox({ roles, username }) {
 
     try {
       const result = await post(`/v1/tasks/${encodeURIComponent(task.token)}/complete`, {
-        idempotency_key: crypto.randomUUID(),
+        idempotency_key: uuid(),
         payload: { decision, ...(reason ? { reason } : {}) },
         kind: isFinanceTask ? 'finance' : 'human',
       })
@@ -1554,7 +1555,7 @@ function SendInvoice({ defaultVendor }) {
           <button
             type="button"
             className="secondary-button"
-            onClick={() => setCustomFields((current) => [...current, { id: crypto.randomUUID(), key: '', value: '' }])}
+            onClick={() => setCustomFields((current) => [...current, { id: uuid(), key: '', value: '' }])}
           >
             Add field
           </button>
@@ -1669,7 +1670,7 @@ function VendorInbox({ username }) {
       await post('/v1/events', {
         transaction_id: task.transaction_id,
         task_token: task.token,
-        idempotency_key: crypto.randomUUID(),
+        idempotency_key: uuid(),
         kind: 'human',
         payload: { decision: 'resubmit', data: filled },
       })
