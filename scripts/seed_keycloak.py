@@ -14,6 +14,7 @@
 #   KEYCLOAK_REALM           realm to seed                   (workflow)
 #   KEYCLOAK_ADMIN           master admin user               (admin)
 #   KEYCLOAK_ADMIN_PASSWORD  master admin password           (admin)
+#   KEYCLOAK_SSL_REQUIRED    realm SSL policy (dev HTTP)      (none)
 #   VM_HOST                  public host for redirect URIs   (localhost)
 #   SEED_USER_PASSWORD       password set for all demo users (12345)
 
@@ -26,6 +27,7 @@ KC = os.getenv("KEYCLOAK_URL", "http://localhost:8081").rstrip("/")
 REALM = os.getenv("KEYCLOAK_REALM", "workflow")
 ADMIN = os.getenv("KEYCLOAK_ADMIN", "admin")
 ADMIN_PW = os.getenv("KEYCLOAK_ADMIN_PASSWORD", "admin")
+SSL_REQUIRED = os.getenv("KEYCLOAK_SSL_REQUIRED", "none").lower()
 VM_HOST = os.getenv("VM_HOST", "localhost")
 USER_PW = os.getenv("SEED_USER_PASSWORD", "12345")
 
@@ -66,15 +68,43 @@ def admin_token() -> str:
 
 
 def main() -> int:
+    if SSL_REQUIRED not in {"none", "external", "all"}:
+        raise ValueError("KEYCLOAK_SSL_REQUIRED must be one of: none, external, all")
+
     s = requests.Session()
     s.headers["Authorization"] = f"Bearer {admin_token()}"
     base = f"{KC}/admin/realms"
 
+    # Public HTTP is intentional for this start-dev deployment. KC_HTTP_ENABLED
+    # opens the HTTP listener but does not override realm-level SSL enforcement,
+    # so update master as well as the application realm. This is idempotent and
+    # can be switched to "external"/"all" when HTTPS is introduced later.
+    master = s.get(f"{base}/master", timeout=15)
+    master.raise_for_status()
+    master_repr = master.json()
+    if master_repr.get("sslRequired") != SSL_REQUIRED:
+        master_repr["sslRequired"] = SSL_REQUIRED
+        s.put(f"{base}/master", json=master_repr, timeout=15).raise_for_status()
+        print(f"realm: updated 'master' sslRequired={SSL_REQUIRED!r}")
+    else:
+        print(f"realm: 'master' sslRequired already {SSL_REQUIRED!r}")
+
     # --- realm (create if missing) ---
-    if s.get(f"{base}/{REALM}", timeout=15).status_code == 404:
-        s.post(f"{base}", json={"realm": REALM, "enabled": True}, timeout=15).raise_for_status()
+    realm_response = s.get(f"{base}/{REALM}", timeout=15)
+    if realm_response.status_code == 404:
+        s.post(
+            f"{base}",
+            json={"realm": REALM, "enabled": True, "sslRequired": SSL_REQUIRED},
+            timeout=15,
+        ).raise_for_status()
         print(f"realm: created {REALM!r}")
     else:
+        realm_response.raise_for_status()
+        realm_repr = realm_response.json()
+        if realm_repr.get("sslRequired") != SSL_REQUIRED:
+            realm_repr["sslRequired"] = SSL_REQUIRED
+            s.put(f"{base}/{REALM}", json=realm_repr, timeout=15).raise_for_status()
+            print(f"realm: updated {REALM!r} sslRequired={SSL_REQUIRED!r}")
         print(f"realm: {REALM!r} already exists")
 
     realm_base = f"{base}/{REALM}"

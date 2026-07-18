@@ -16,7 +16,7 @@ cd "$APP_DIR"
 COMPOSE=(sudo docker compose -f "$APP_DIR/docker-compose.dev.yml")
 RUN_USER="$(whoami)"
 UV_BIN="$HOME/.local/bin/uv"
-VM_HOST="${VM_HOST:-localhost}"     # exported by the pipeline; defaults for manual runs
+export VM_HOST="${VM_HOST:-localhost}"  # public Compose/SPA host; defaults for local runs
 echo "==> deploy_vm.sh  APP_DIR=$APP_DIR  USER=$RUN_USER  VM_HOST=$VM_HOST  uv=$UV_BIN"
 
 # Fail early with a useful message if the non-interactive SSH environment cannot
