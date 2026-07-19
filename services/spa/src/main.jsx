@@ -1,3 +1,4 @@
+import './polyfills' // MUST be first: installs crypto.randomUUID for HTTP (pre-keycloak)
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import App from './App.jsx'
