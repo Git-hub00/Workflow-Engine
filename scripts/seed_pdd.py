@@ -8,14 +8,15 @@
 # UNIQUE(definition_id, version) constraint or creating duplicates.
 
 import json
+import os
 import uuid
 from pathlib import Path
 
 from sqlalchemy import create_engine, text
 
-# WHY hard-code the URL: this is a dev bootstrap script targeting the
-# docker-compose Postgres directly; there is no app settings layer yet.
-DB_URL = "postgresql+psycopg://app:app@localhost:5432/workflow_app"
+# Env-driven so the seed runs against localhost (host/systemd) or the Docker
+# service name (compose sets DATABASE_URL=...@postgres:5432/...).
+DB_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://app:app@localhost:5432/workflow_app")
 
 # WHY resolve the path relative to __file__: the script is invoked from the
 # services/api directory (via `uv run --directory services\api ...`), so the

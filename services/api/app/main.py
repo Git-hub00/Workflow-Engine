@@ -39,9 +39,12 @@ from invoice_workflow import InvoiceWorkflow  # noqa: E402  (after sys.path twea
 # Module-level SQLAlchemy engine: created once, connection-pooled, reused by every
 # request. (These calls are synchronous/blocking; fine for the MVP. Under real
 # load the DB work should be offloaded to a thread, e.g. asyncio.to_thread.)
-DB_URL = "postgresql+psycopg://app:app@localhost:5432/workflow_app"
+# Connection targets are env-driven so the SAME code runs both as a host process
+# (systemd; defaults point at localhost) and inside a container (compose sets these
+# to Docker service names: postgres / temporal).
+DB_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://app:app@localhost:5432/workflow_app")
 engine = create_engine(DB_URL)
-TEMPORAL_ADDRESS = "localhost:7233"
+TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
 
 
 # WHY lifespan: connecting to Temporal is relatively costly and should happen
@@ -79,7 +82,12 @@ app.add_middleware(
 
 # JWKS endpoint for the "workflow" realm. PyJWKClient fetches the signing keys
 # lazily (on first use), so importing this module does no network I/O.
-KEYCLOAK_JWKS_URL = "http://localhost:8081/realms/workflow/protocol/openid-connect/certs"
+# Built from KEYCLOAK_URL so the API can reach Keycloak by its internal Docker
+# service name (http://keycloak:8080) in containers, or localhost:8081 on the host.
+KEYCLOAK_JWKS_URL = (
+    f"{os.getenv('KEYCLOAK_URL', 'http://localhost:8081').rstrip('/')}"
+    f"/realms/{os.getenv('KEYCLOAK_REALM', 'workflow')}/protocol/openid-connect/certs"
+)
 
 # JWKS hardening — prevents false 401s after a Keycloak signing-key rotation:
 #   * cache_keys / max_cached_keys: cache resolved signing keys (bounded LRU) so we

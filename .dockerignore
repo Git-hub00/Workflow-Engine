@@ -1,0 +1,23 @@
+# Keep build contexts small and images clean/secret-free.
+.git
+**/.git
+
+# Python
+**/.venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+
+# Node / Vite (installed fresh in the build image; host copies may be OS-specific)
+**/node_modules
+services/spa/dist
+
+# Secrets & local env — provided at runtime via compose env_file, never baked in
+**/.env
+**/*.env
+!**/.env.example
+
+# Editor / OS cruft
+**/.DS_Store
+**/.idea
+**/.vscode

@@ -54,7 +54,7 @@ from invoice_workflow import InvoiceWorkflow  # noqa: E402
 
 async def main():
     # One client/connection is shared by both workers.
-    client = await Client.connect("localhost:7233")
+    client = await Client.connect(os.getenv("TEMPORAL_ADDRESS", "localhost:7233"))
 
     # Worker 1 — the MAIN queue. Hosts the workflow and every activity EXCEPT
     # ai_review. 8 threads so many invoices' DB/notify work runs concurrently.

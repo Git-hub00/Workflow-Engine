@@ -38,7 +38,7 @@ from sqlalchemy.exc import IntegrityError
 # root is parents[3] and the env file is under services/api/.
 load_dotenv(Path(__file__).resolve().parents[3] / "services" / "api" / ".env")
 
-DB_URL = "postgresql+psycopg://app:app@localhost:5432/workflow_app"
+DB_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://app:app@localhost:5432/workflow_app")
 
 # Module-level engine: created once and reused across activity invocations
 # (SQLAlchemy pools connections internally).

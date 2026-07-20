@@ -1,0 +1,91 @@
+# Application overlay — the Dockerized app tier (API, Temporal worker, email
+# adapter, migrate/seed, and the SPA/nginx). Run it TOGETHER with the infra file
+# so both share one network and services resolve each other by name:
+#
+#   docker compose -f docker-compose.dev.yml -f docker-compose.app.yml up -d --build
+#
+# The app containers replace the old systemd services + host nginx. Infra
+# (postgres, temporal, temporal-ui, keycloak, ollama, langfuse) stays in
+# docker-compose.dev.yml. Public host for browser-facing URLs comes from VM_HOST.
+
+# Shared build for the three backend containers (one image, three commands).
+x-backend-build: &backend-build
+  context: .
+  dockerfile: deploy/docker/backend.Dockerfile
+
+# Infra addresses by docker service name (override the localhost values in .env).
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql+psycopg://app:app@postgres:5432/workflow_app
+  TEMPORAL_ADDRESS: temporal:7233
+  KEYCLOAK_URL: http://keycloak:8080
+  KEYCLOAK_REALM: workflow
+  LLM_BASE_URL: http://ollama:11434/v1
+
+services:
+  # --- one-shot: DB migrations + PDD seed + Keycloak seed --------------------
+  migrate:
+    build: *backend-build
+    image: workflow-backend:latest
+    command: ["sh", "/app/scripts/docker_bootstrap.sh"]
+    env_file: [services/api/.env]   # secrets: GMAIL_*, NOTIFY_TO, LLM_MODEL, KEYCLOAK_ADMIN*
+    environment:
+      <<: *backend-env
+      VM_HOST: ${VM_HOST:-localhost}   # public host baked into Keycloak redirect URIs
+    depends_on: [postgres, keycloak]
+    restart: "no"
+
+  # --- FastAPI (Transaction API, Event Ingress, Task Service, Config) --------
+  api:
+    build: *backend-build
+    image: workflow-backend:latest
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file: [services/api/.env]
+    environment: *backend-env
+    depends_on:
+      postgres: {condition: service_started}
+      temporal: {condition: service_started}
+      migrate: {condition: service_completed_successfully}
+    restart: unless-stopped
+
+  # --- Temporal worker (workflow + activities, incl. LLM decision) ----------
+  worker:
+    build: *backend-build
+    image: workflow-backend:latest
+    command: ["python", "/app/services/worker/main.py"]
+    env_file: [services/api/.env]
+    environment: *backend-env
+    depends_on:
+      temporal: {condition: service_started}
+      postgres: {condition: service_started}
+      migrate: {condition: service_completed_successfully}
+    restart: unless-stopped
+
+  # --- Email adapter (IMAP poller -> POST /v1/events) -----------------------
+  adapter:
+    build: *backend-build
+    image: workflow-backend:latest
+    command: ["python", "/app/services/worker/notifier/email_adapter.py"]
+    env_file: [services/api/.env]
+    environment:
+      <<: *backend-env
+      API_BASE_URL: http://api:8000
+    depends_on:
+      api: {condition: service_started}
+      migrate: {condition: service_completed_successfully}
+    restart: unless-stopped
+
+  # --- SPA + nginx (serves the app on :80, proxies /api/ -> api:8000) --------
+  web:
+    build:
+      context: .
+      dockerfile: deploy/docker/web.Dockerfile
+      args:
+        VITE_API_BASE_URL: /api
+        VITE_KEYCLOAK_URL: http://${VM_HOST:-localhost}:8081
+        VITE_KEYCLOAK_REALM: workflow
+        VITE_KEYCLOAK_CLIENT_ID: workflow-spa
+    image: workflow-web:latest
+    ports: ["80:80"]
+    depends_on:
+      api: {condition: service_started}
+    restart: unless-stopped
