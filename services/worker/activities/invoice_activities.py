@@ -485,8 +485,20 @@ def _resolve_recipients(txn_id: str, recipient: dict | None) -> list:
     return _fallback_recipients()
 
 
+def _get_mailbox(name):
+    # Resolve the SENDER mailbox (address + app password + hosts) by name from the
+    # registry; falls back to the default (legacy GMAIL_*). The PDD carries only the
+    # mailbox NAME — the credentials live in env/secrets, never in the PDD.
+    notifier_dir = Path(__file__).resolve().parent.parent / "notifier"
+    if str(notifier_dir) not in sys.path:
+        sys.path.insert(0, str(notifier_dir))
+    from mailboxes import get_mailbox
+    return get_mailbox(name)
+
+
 @activity.defn
-async def notify(txn_id: str, channel: str, message: str, recipient: dict | None = None) -> None:
+async def notify(txn_id: str, channel: str, message: str, recipient: dict | None = None,
+                 mailbox: str | None = None) -> None:
     # Recipients come from the PDD notification rule the interpreter passes
     # (role / submitter / literal), NOT hardcoded — so manager tasks reach
     # managers, finance tasks reach finance, and approvals/rejections reach the
@@ -510,25 +522,24 @@ async def notify(txn_id: str, channel: str, message: str, recipient: dict | None
     if channel != "email":
         return
 
-    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    gmail_address = os.getenv("GMAIL_ADDRESS")
-    gmail_app_password = os.getenv("GMAIL_APP_PASSWORD")
-    if not (gmail_address and gmail_app_password and recipients):
-        print("notify: SMTP not configured or no recipients resolved; skipping send")
+    # Sender mailbox is chosen by the process's PDD `mailbox` name (per-process),
+    # resolved to real credentials from the registry (falls back to default).
+    box = _get_mailbox(mailbox)
+    if not (box and recipients):
+        print("notify: no sender mailbox configured or no recipients resolved; skipping send")
         return
 
     msg = EmailMessage()
     # The [invoice-<txn_id>] tag ties replies back to this run (email adapter 9.3).
     msg["Subject"] = f"[invoice-{txn_id}] {message}"
-    msg["From"] = gmail_address
+    msg["From"] = box["address"]
     msg["To"] = ", ".join(recipients)
     msg.set_content(f"{message}\n\nReply to this email with your decision (e.g. approve / reject / return).")
 
     try:
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
+        with smtplib.SMTP(box["smtp_host"], box["smtp_port"]) as server:
             server.starttls()
-            server.login(gmail_address, gmail_app_password)
+            server.login(box["address"], box["app_password"])
             server.send_message(msg)
     except Exception as e:
         # A notification failure must NOT fail the workflow — the audit event is

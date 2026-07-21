@@ -302,42 +302,62 @@ def poll_once(client, api_base_url: str) -> list[str]:
 
 def main():
     # WHY this is a standalone process: the live email adapter runs as its OWN
-    # process alongside the API and the Temporal worker. It watches the mailbox
-    # and converts reply emails into /v1/events calls that resume paused workflows.
+    # process alongside the API and the Temporal worker. It watches EVERY
+    # configured mailbox and converts reply emails into /v1/events calls that
+    # resume paused workflows. Different processes can use different mailboxes
+    # (see mailboxes.py), so we connect to and poll each one.
     env_path = Path(__file__).resolve().parents[3] / "services" / "api" / ".env"
     load_dotenv(env_path)
-
-    gmail_address = os.getenv("GMAIL_ADDRESS")
-    gmail_app_password = os.getenv("GMAIL_APP_PASSWORD")
-    imap_host = os.getenv("IMAP_HOST")
     api_base_url = os.getenv("API_BASE_URL", "http://localhost:8000")
 
-    if not (gmail_address and gmail_app_password and imap_host):
-        print("ERROR: missing GMAIL_ADDRESS / GMAIL_APP_PASSWORD / IMAP_HOST in .env")
+    from mailboxes import all_mailboxes  # notifier dir is on sys.path (script dir)
+    boxes = all_mailboxes()
+    if not boxes:
+        print("ERROR: no mailboxes configured "
+              "(set GMAIL_ADDRESS/GMAIL_APP_PASSWORD or MAILBOX_<NAME>_ADDRESS/_APP_PASSWORD)")
         return
 
-    client = IMAPClient(imap_host, ssl=True)
-    client.login(gmail_address, gmail_app_password)
-    # NOT readonly: we need write access to set the \Seen flag.
-    client.select_folder("INBOX")
-    print(f"Email adapter connected as {gmail_address}; polling INBOX every 15s "
-          f"(POSTing to {api_base_url}/v1/events). Ctrl+C to stop.")
+    # Connect to each mailbox (NOT readonly: we set \Seen on handled messages).
+    clients = []
+    for box in boxes:
+        try:
+            client = IMAPClient(box["imap_host"], ssl=True)
+            client.login(box["address"], box["app_password"])
+            client.select_folder("INBOX")
+            clients.append((box, client))
+            print(f"Email adapter connected: {box['address']} (mailbox '{box['name']}')")
+        except Exception as exc:
+            print(f"Email adapter: FAILED to connect {box['address']}: {exc}")
+
+    if not clients:
+        print("ERROR: no mailbox connections succeeded")
+        return
+    print(f"Polling {len(clients)} mailbox(es) every 15s (POSTing to {api_base_url}/v1/events). "
+          "Ctrl+C to stop.")
 
     try:
         while True:
-            results = poll_once(client, api_base_url)
             ts = datetime.now().strftime("%H:%M:%S")
-            for r in results:
-                print(f"[{ts}] {r}")
-            print(f"[{ts}] polled, {len(results)} new")
+            total = 0
+            for box, client in clients:
+                try:
+                    results = poll_once(client, api_base_url)
+                except Exception as exc:
+                    print(f"[{ts}] {box['name']}: poll error: {exc}")
+                    continue
+                for r in results:
+                    print(f"[{ts}] {box['name']}: {r}")
+                total += len(results)
+            print(f"[{ts}] polled {len(clients)} mailbox(es), {total} new")
             time.sleep(15)
     except KeyboardInterrupt:
         print("\nStopping email adapter...")
     finally:
-        try:
-            client.logout()
-        except Exception:
-            pass
+        for _, client in clients:
+            try:
+                client.logout()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

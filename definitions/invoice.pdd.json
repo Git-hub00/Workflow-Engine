@@ -1,6 +1,7 @@
 {
   "process_key": "invoice_approval",
   "version": 1,
+  "mailbox": "invoice",
   "roles": { "review": "vendor", "manager": "ap_manager", "finance": "finance" },
   "config": {
     "autoApproveUnder": 500,

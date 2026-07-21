@@ -16,6 +16,10 @@
       "minimum": 1,
       "description": "Definition version. In-flight transactions stay pinned to the version they started on."
     },
+    "mailbox": {
+      "type": "string",
+      "description": "Name of the mailbox this process sends/receives from. Resolved to real credentials via MAILBOX_<NAME>_* env secrets, falling back to the default mailbox. The NAME is safe to store here; the app password is NOT (it lives in secrets)."
+    },
     "roles": {
       "type": "object",
       "description": "Maps logical role names used inside the PDD to real Keycloak realm roles.",

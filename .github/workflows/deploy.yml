@@ -61,6 +61,11 @@ jobs:
             GMAIL_ADDRESS=${{ vars.GMAIL_ADDRESS }}
             GMAIL_APP_PASSWORD=${{ secrets.GMAIL_APP_PASSWORD }}
             NOTIFY_TO=${{ vars.NOTIFY_TO }}
+            # Per-process mailboxes (optional). If a value is empty, the process
+            # falls back to the default GMAIL_* mailbox above. Add more by copying
+            # this pair with a new NAME and creating the matching GitHub var/secret.
+            MAILBOX_INVOICE_ADDRESS=${{ vars.MAILBOX_INVOICE_ADDRESS }}
+            MAILBOX_INVOICE_APP_PASSWORD=${{ secrets.MAILBOX_INVOICE_APP_PASSWORD }}
             IMAP_HOST=imap.gmail.com
             SMTP_HOST=smtp.gmail.com
             SMTP_PORT=587

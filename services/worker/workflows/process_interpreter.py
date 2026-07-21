@@ -44,6 +44,7 @@ class ProcessInterpreterWorkflow:
         self._finance_result = None
         self._roles = {}
         self._notifications = []
+        self._mailbox = None
 
     @workflow.signal
     def human_decision(self, payload: dict):
@@ -67,6 +68,7 @@ class ProcessInterpreterWorkflow:
         cfg = {**pdd.get("config", {}), "roles": pdd.get("roles", {})}
         self._roles = pdd.get("roles", {})
         self._notifications = pdd.get("notifications", [])
+        self._mailbox = pdd.get("mailbox")
         nodes = {n["id"]: n for n in pdd.get("nodes", []) if "id" in n}
 
         await workflow.execute_activity(
@@ -237,13 +239,13 @@ class ProcessInterpreterWorkflow:
 
         message, recipient = self._task_notification(node, need)
         await workflow.execute_activity(
-            notify, args=[txn_id, "email", message, recipient], start_to_close_timeout=_T_SHORT)
+            notify, args=[txn_id, "email", message, recipient, self._mailbox], start_to_close_timeout=_T_SHORT)
 
         sla_hours = (node.get("timeout") or {}).get("slaHours") or cfg.get("slaHours") or 48
         if not await workflow.wait_condition(lambda: self._signal is not None,
                                              timeout=timedelta(hours=sla_hours)):
             await workflow.execute_activity(
-                notify, args=[txn_id, "email", "Reminder / escalation", recipient],
+                notify, args=[txn_id, "email", "Reminder / escalation", recipient, self._mailbox],
                 start_to_close_timeout=_T_SHORT)
             await workflow.wait_condition(lambda: self._signal is not None)
         return self._signal
@@ -269,7 +271,7 @@ class ProcessInterpreterWorkflow:
         # PDD-driven notifications make it correct now).
         message, recipient = self._task_notification(node, None)
         await workflow.execute_activity(
-            notify, args=[txn_id, "email", message, recipient], start_to_close_timeout=_T_SHORT)
+            notify, args=[txn_id, "email", message, recipient, self._mailbox], start_to_close_timeout=_T_SHORT)
 
         def decided():
             if self._finance_result is not None:
@@ -299,7 +301,7 @@ class ProcessInterpreterWorkflow:
         # post_to_erp is modeled as the PDD 'finalize' node, already run before an
         # approved 'end'. Here we only notify + persist the terminal status.
         await workflow.execute_activity(
-            notify, args=[txn_id, "email", message, recipient], start_to_close_timeout=_T_SHORT)
+            notify, args=[txn_id, "email", message, recipient, self._mailbox], start_to_close_timeout=_T_SHORT)
         await workflow.execute_activity(
             set_transaction_status, args=[txn_id, outcome], start_to_close_timeout=_T_SHORT)
         return outcome
