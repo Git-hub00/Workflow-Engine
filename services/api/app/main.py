@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import jwt
+import requests
 from jwt import PyJWKClient
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -33,8 +34,13 @@ for _sub in ("workflows", "activities"):
     _d = SERVICES_DIR / "worker" / _sub
     if str(_d) not in sys.path:
         sys.path.insert(0, str(_d))
+# scripts/ holds the shared PDD validator (also used by the CLI and seeds).
+_SCRIPTS_DIR = SERVICES_DIR.parent / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from process_interpreter import ProcessInterpreterWorkflow  # noqa: E402  (generic engine)
+from pdd_validation import validate_pdd  # noqa: E402  (structural PDD checks)
 
 # Module-level SQLAlchemy engine: created once, connection-pooled, reused by every
 # request. (These calls are synchronous/blocking; fine for the MVP. Under real
@@ -1080,6 +1086,139 @@ async def put_config(process_key: str, body: ConfigIn, user: dict = Depends(requ
     # with these new values (this mirrors the prototype's Config tab). In-flight
     # workflows keep the cfg snapshot they were started with — only new runs change.
     return {"status": "updated", "process_key": process_key, "config": body.config}
+
+
+# ===========================================================================
+# Definition Service (Section 5.1 / P3): author, validate, and publish PDDs.
+# Static validation on publish (graph structure + referenced roles exist in
+# Keycloak). New versions are immutable; in-flight transactions stay pinned.
+# ===========================================================================
+
+
+def _keycloak_realm_roles() -> set | None:
+    # Names of all realm roles in Keycloak; None if unreachable (publish then warns
+    # instead of hard-failing on a transient Keycloak outage).
+    kc = os.getenv("KEYCLOAK_URL", "http://localhost:8081").rstrip("/")
+    realm = os.getenv("KEYCLOAK_REALM", "workflow")
+    try:
+        token = requests.post(
+            f"{kc}/realms/master/protocol/openid-connect/token",
+            data={"client_id": "admin-cli", "grant_type": "password",
+                  "username": os.getenv("KEYCLOAK_ADMIN", "admin"),
+                  "password": os.getenv("KEYCLOAK_ADMIN_PASSWORD", "admin")},
+            timeout=10,
+        ).json().get("access_token")
+        if not token:
+            return None
+        roles = requests.get(
+            f"{kc}/admin/realms/{realm}/roles",
+            headers={"Authorization": f"Bearer {token}"}, timeout=10,
+        ).json()
+        return {r["name"] for r in roles if isinstance(r, dict) and r.get("name")}
+    except Exception as exc:
+        print(f"definitions: keycloak role fetch failed: {exc}")
+        return None
+
+
+def _check_pdd(pdd: dict) -> tuple[list, list]:
+    # Structural validation (shared validator) + Keycloak role-existence.
+    errors, warnings = validate_pdd(pdd)
+    roles_map = pdd.get("roles", {}) if isinstance(pdd.get("roles"), dict) else {}
+    realm_roles = _keycloak_realm_roles()
+    if realm_roles is None:
+        warnings.append("could not reach Keycloak to verify roles exist")
+    else:
+        for logical, kc_role in roles_map.items():
+            if kc_role not in realm_roles:
+                errors.append(f"role '{kc_role}' (mapped from '{logical}') does not exist in Keycloak")
+    return errors, warnings
+
+
+class DefinitionIn(BaseModel):
+    pdd: dict
+    publish: bool = True
+
+
+# WHY POST /v1/definitions/validate: dry-run the checks so an author sees errors
+# BEFORE publishing. Open (read-like); it writes nothing.
+@app.post("/v1/definitions/validate")
+async def validate_definition(body: DefinitionIn):
+    errors, warnings = _check_pdd(body.pdd)
+    return {"valid": not errors, "errors": errors, "warnings": warnings}
+
+
+# WHY POST /v1/definitions: author/publish a NEW version of a process. Gated by
+# process_author. Validates first; a new immutable version is created (max+1).
+@app.post("/v1/definitions")
+async def create_definition(body: DefinitionIn, user: dict = Depends(require_role("process_author"))):
+    pdd = body.pdd
+    process_key = pdd.get("process_key")
+    if not process_key:
+        raise HTTPException(status_code=400, detail="pdd.process_key is required")
+
+    errors, warnings = _check_pdd(pdd)
+    if errors:
+        raise HTTPException(status_code=400, detail={"errors": errors, "warnings": warnings})
+
+    status = "published" if body.publish else "draft"
+    with engine.begin() as conn:
+        definition_id = conn.execute(
+            text("SELECT id FROM process_definition WHERE process_key = :pk"),
+            {"pk": process_key},
+        ).scalar_one_or_none()
+        if definition_id is None:
+            definition_id = uuid.uuid4()
+            conn.execute(
+                text("INSERT INTO process_definition (id, process_key) VALUES (CAST(:id AS uuid), :pk)"),
+                {"id": str(definition_id), "pk": process_key},
+            )
+        max_version = conn.execute(
+            text("SELECT COALESCE(MAX(version), 0) FROM definition_version "
+                 "WHERE definition_id = CAST(:d AS uuid)"),
+            {"d": str(definition_id)},
+        ).scalar_one()
+        new_version = int(max_version) + 1
+        pdd_to_store = {**pdd, "version": new_version}  # keep the stored version authoritative
+        conn.execute(
+            text("INSERT INTO definition_version "
+                 "(id, definition_id, version, pdd, status, published_at) "
+                 "VALUES (CAST(:id AS uuid), CAST(:d AS uuid), :v, CAST(:pdd AS jsonb), :st, "
+                 "        CASE WHEN :st = 'published' THEN now() ELSE NULL END)"),
+            {"id": str(uuid.uuid4()), "d": str(definition_id), "v": new_version,
+             "pdd": json.dumps(pdd_to_store), "st": status},
+        )
+    return {"process_key": process_key, "version": new_version, "status": status, "warnings": warnings}
+
+
+# WHY GET /v1/definitions: list processes with their latest version for a catalog UI.
+@app.get("/v1/definitions")
+async def list_definitions():
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT pd.process_key AS process_key, "
+            "       MAX(dv.version) AS latest_version, "
+            "       COUNT(*) FILTER (WHERE dv.status = 'published') AS published_versions "
+            "FROM process_definition pd "
+            "LEFT JOIN definition_version dv ON dv.definition_id = pd.id "
+            "GROUP BY pd.process_key ORDER BY pd.process_key"
+        )).mappings().all()
+    return [dict(r) for r in rows]
+
+
+# WHY GET /v1/definitions/{process_key}: fetch the latest PUBLISHED pdd (nodes,
+# edges, forms) so a UI can render the process. 404 if none published.
+@app.get("/v1/definitions/{process_key}")
+async def get_definition(process_key: str):
+    with engine.connect() as conn:
+        pdd = conn.execute(text(
+            "SELECT dv.pdd FROM definition_version dv "
+            "JOIN process_definition pd ON pd.id = dv.definition_id "
+            "WHERE pd.process_key = :pk AND dv.status = 'published' "
+            "ORDER BY dv.version DESC LIMIT 1"
+        ), {"pk": process_key}).scalar_one_or_none()
+    if pdd is None:
+        raise HTTPException(status_code=404, detail=f"No published definition for '{process_key}'")
+    return pdd
 
 
 # ===========================================================================
