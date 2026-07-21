@@ -557,7 +557,7 @@ async def post_to_erp(txn_id: str, data: dict) -> None:
     # conn (its own transaction) is already atomic here.
     await append_event(
         txn_id, "ext", "ERP_POSTED", "post_to_erp",
-        "Invoice posted to ERP (stub)", idempotency_key=None,
+        "Posted to system of record (stub)", idempotency_key=None,
     )
 
 

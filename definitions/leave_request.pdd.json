@@ -1,0 +1,57 @@
+{
+  "process_key": "leave_request",
+  "version": 1,
+  "mailbox": "leave",
+  "roles": { "manager": "ap_manager" },
+  "config": {
+    "autoApproveDays": 2,
+    "slaHours": 48
+  },
+  "data_schema": {
+    "employee": "string",
+    "startDate": "string",
+    "endDate": "string",
+    "days": "number",
+    "reason": "string"
+  },
+  "notifications": [
+    { "on": "task_created:manager", "to_role": "manager", "template": "A leave request needs your approval" },
+    { "on": "completed:approved", "to": "submitter", "template": "Your leave request was approved." },
+    { "on": "completed:rejected", "to": "submitter", "template": "Your leave request was rejected: {reason}" }
+  ],
+  "nodes": [
+    { "id": "start", "type": "start", "next": "load" },
+    { "id": "load", "type": "automated", "action": "extract_fields", "next": "check" },
+    {
+      "id": "check",
+      "type": "llm_decision",
+      "routes": [
+        { "edge": "AUTO_APPROVE", "when": "days <= autoApproveDays" },
+        { "edge": "MANAGER", "when": "default" }
+      ],
+      "edges": {
+        "AUTO_APPROVE": "finalize",
+        "MANAGER": "manager"
+      }
+    },
+    {
+      "id": "manager",
+      "type": "human_task",
+      "assignment": { "role": "manager" },
+      "form_schema": {
+        "fields": [
+          { "key": "decision", "type": "enum", "values": ["approve", "reject"], "required": true },
+          { "key": "reason", "type": "string", "required": false }
+        ]
+      },
+      "timeout": { "slaHours": 48, "on_timeout": "remind" },
+      "edges": [
+        { "when": "decision == 'reject'", "to": "end_rejected" },
+        { "when": "default", "to": "finalize" }
+      ]
+    },
+    { "id": "finalize", "type": "automated", "action": "post_to_erp", "next": "end_approved" },
+    { "id": "end_approved", "type": "end", "outcome": "approved" },
+    { "id": "end_rejected", "type": "end", "outcome": "rejected" }
+  ]
+}

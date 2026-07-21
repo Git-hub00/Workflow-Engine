@@ -1,0 +1,19 @@
+# Opt-in auto-HTTPS reverse proxy (P7 hardening). Fronts the SPA/API and Keycloak
+# with real TLS using a free nip.io hostname (no domain purchase). See
+# docs/HARDENING.md for the full enable steps. Caddy obtains + renews Let's Encrypt
+# certs automatically. Placeholders {$APP_HOST}/{$KC_HOST} come from Caddy's env.
+#
+# Example (VM IP 4.240.101.91):
+#   APP_HOST = app.4.240.101.91.nip.io
+#   KC_HOST  = kc.4.240.101.91.nip.io
+
+{$APP_HOST} {
+	# SPA + API (nginx web container serves the SPA and proxies /api/ internally)
+	reverse_proxy web:80
+}
+
+{$KC_HOST} {
+	# Keycloak — must be HTTPS too, or the HTTPS SPA's calls to it are blocked
+	# as mixed content. With TLS here you can re-enable PKCE S256 in the SPA.
+	reverse_proxy keycloak:8080
+}
