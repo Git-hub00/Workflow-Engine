@@ -9,7 +9,8 @@
     "quorum": { "n": 2, "of": 3 },
     "rejectShortCircuits": true,
     "slaHours": 48,
-    "approvedVendors": ["Acme Supplies", "Globex Inc", "Initech", "Northwind Traders"]
+    "approvedVendors": ["Acme Supplies", "Globex Inc", "Initech", "Northwind Traders"],
+    "anomalyAmountAbove": 20000
   },
   "data_schema": {
     "vendor": "string",
@@ -36,9 +37,9 @@
       "id": "review",
       "type": "llm_decision",
       "routes": [
-        { "edge": "REQUEST_INFO", "when": "missing(requiredFields)" },
-        { "edge": "AUTO_APPROVE", "when": "amount < config.autoApproveUnder && !anomaly" },
-        { "edge": "MANAGER_THEN_FINANCE", "when": "amount >= config.financeThreshold || anomaly" },
+        { "edge": "REQUEST_INFO", "when": "has_missing" },
+        { "edge": "AUTO_APPROVE", "when": "amount < autoApproveUnder and not anomaly" },
+        { "edge": "MANAGER_THEN_FINANCE", "when": "amount >= financeThreshold or anomaly" },
         { "edge": "MANAGER_ONLY", "when": "default" }
       ],
       "edges": {

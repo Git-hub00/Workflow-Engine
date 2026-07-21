@@ -39,10 +39,13 @@ ROLES = ["ap_manager", "finance", "ops_admin", "process_author", "vendor"]
 
 # Demo users -> (realm roles, optional email). Password is USER_PW for all.
 USERS = {
-    "manager1": (["ap_manager"], None),
-    "finance1": (["finance"], None),
-    "finance2": (["finance"], None),
-    "author1": (["process_author"], None),
+    # Internal-role emails are DEMO PLACEHOLDERS (the user's own inbox) so that
+    # role-based notifications actually deliver. Change these to real per-user
+    # addresses in the Keycloak admin console (or here) for a true multi-user demo.
+    "manager1": (["ap_manager"], "realgowtham2005@gmail.com"),
+    "finance1": (["finance"], "realgowtham2005@gmail.com"),
+    "finance2": (["finance"], "realgowtham2005@gmail.com"),
+    "author1": (["process_author"], "realgowtham2005@gmail.com"),
     "vendor_acme": (["vendor"], "og.gowtham.sk@gmail.com"),
     "vendor_globex": (["vendor"], "zencoderku001@gmail.com"),
 }

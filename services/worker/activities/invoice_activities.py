@@ -186,17 +186,19 @@ async def extract_fields(txn_id: str) -> dict:
 # extract_fields; its returned route drives the next branch (auto-approve /
 # request-info / manager / manager-then-finance).
 @activity.defn
-async def ai_review(txn_id: str, data: dict, cfg: dict) -> dict:
-    # review_invoice lives at services/worker/decisions/invoice_review.py, which
-    # is NOT importable as a package (worker.decisions). Resolve it robustly by
-    # adding the decisions directory (relative to THIS file) to sys.path, then
-    # importing by module name.
+async def ai_review(txn_id: str, data: dict, cfg: dict, node: dict | None = None) -> dict:
+    # Bounded decision. Prefer the GENERIC engine (decision_engine.decide reads the
+    # routes from the PDD llm_decision node and runs a real LangGraph StateGraph);
+    # fall back to the legacy invoice-specific rules only if no node/routes given.
     decisions_dir = Path(__file__).resolve().parent.parent / "decisions"
     if str(decisions_dir) not in sys.path:
         sys.path.insert(0, str(decisions_dir))
-    from invoice_review import review_invoice
-
-    result = review_invoice(data, cfg)
+    if node and node.get("routes"):
+        from decision_engine import decide
+        result = decide(node, data, cfg)
+    else:
+        from invoice_review import review_invoice
+        result = review_invoice(data, cfg)
     # The audit event is this activity's ONLY database write (there is no
     # separate business row), so calling append_event WITHOUT conn — letting it
     # open its own transaction — is already atomic for ai_review.
@@ -421,28 +423,86 @@ def _latest_reject_reason(txn_id: str) -> str | None:
         ).scalar_one_or_none()
 
 
-@activity.defn
-async def notify(txn_id: str, channel: str, message: str) -> None:
-    # Terminal rejection notice goes to the SUBMITTING VENDOR and carries the
-    # rejecting person's reason (read from the event log). The workflow still
-    # calls notify(txn_id, "email", "Invoice rejected") — signature unchanged.
-    is_rejection = message == "Invoice rejected"
-    reason = _latest_reject_reason(txn_id) if is_rejection else None
-    recipient = None
-    if channel == "email":
-        if is_rejection:
-            recipient = _submitted_by_email(txn_id) or os.getenv("NOTIFY_TO")
-        else:
-            # request_info notifications target the submitting vendor; everything
-            # else (and any resolution failure) falls back to NOTIFY_TO.
-            recipient = _vendor_email_for_txn(txn_id) or os.getenv("NOTIFY_TO")
+def _kc_admin_token(kc: str) -> str | None:
+    try:
+        return requests.post(
+            f"{kc}/realms/master/protocol/openid-connect/token",
+            data={
+                "client_id": "admin-cli",
+                "grant_type": "password",
+                "username": os.getenv("KEYCLOAK_ADMIN", "admin"),
+                "password": os.getenv("KEYCLOAK_ADMIN_PASSWORD", "admin"),
+            },
+            timeout=10,
+        ).json().get("access_token")
+    except Exception as exc:
+        print(f"notify: keycloak admin token failed: {exc}")
+        return None
 
-    # 1. Durable audit write — the source of truth. Records recipient (+ reason
-    #    for rejections) so the audit shows who was told what.
+
+def _emails_for_role(role: str) -> list:
+    # Every Keycloak user holding `role`, with an email. Drives role-based
+    # notifications (e.g. email the ap_manager(s) when an approval task appears).
+    if not role:
+        return []
+    kc = os.getenv("KEYCLOAK_URL", "http://localhost:8081")
+    realm = os.getenv("KEYCLOAK_REALM", "workflow")
+    token = _kc_admin_token(kc)
+    if not token:
+        return []
+    try:
+        users = requests.get(
+            f"{kc}/admin/realms/{realm}/roles/{role}/users",
+            headers={"Authorization": f"Bearer {token}"}, timeout=10,
+        ).json()
+    except Exception as exc:
+        print(f"notify: role-email lookup failed for {role!r}: {exc}")
+        return []
+    return [u["email"] for u in users if isinstance(u, dict) and u.get("email")]
+
+
+def _fallback_recipients() -> list:
+    to = os.getenv("NOTIFY_TO")
+    return [to] if to else []
+
+
+def _resolve_recipients(txn_id: str, recipient: dict | None) -> list:
+    # Turn a recipient spec (from the PDD notification rule the interpreter passes)
+    # into concrete emails:
+    #   {"to_email": "x@y"} -> literal
+    #   {"to": "submitter"} -> the user/vendor who submitted this transaction
+    #   {"to_role": "<kc>"} -> every Keycloak user holding that realm role
+    #   None / unresolved   -> NOTIFY_TO fallback (so nothing is silently dropped)
+    if not recipient:
+        return _fallback_recipients()
+    if recipient.get("to_email"):
+        return [recipient["to_email"]]
+    if recipient.get("to") == "submitter":
+        email = _submitted_by_email(txn_id)
+        return [email] if email else _fallback_recipients()
+    if recipient.get("to_role"):
+        return _emails_for_role(recipient["to_role"]) or _fallback_recipients()
+    return _fallback_recipients()
+
+
+@activity.defn
+async def notify(txn_id: str, channel: str, message: str, recipient: dict | None = None) -> None:
+    # Recipients come from the PDD notification rule the interpreter passes
+    # (role / submitter / literal), NOT hardcoded — so manager tasks reach
+    # managers, finance tasks reach finance, and approvals/rejections reach the
+    # submitter. {reason} in a template is filled from the latest reject decision.
+    reason = None
+    if message and "{reason}" in message:
+        reason = _latest_reject_reason(txn_id)
+        message = message.replace("{reason}", reason or "No reason recorded")
+
+    recipients = _resolve_recipients(txn_id, recipient) if channel == "email" else []
+
+    # 1. Durable audit write — records the ACTUAL recipients so the audit is truthful.
     await append_event(
         txn_id, "notify", "NOTIFY", "NotificationService",
         f"{channel}: {message}",
-        payload={k: v for k, v in {"recipient": recipient, "reason": reason}.items() if v},
+        payload={k: v for k, v in {"recipients": recipients, "reason": reason}.items() if v},
         idempotency_key=None,
     )
 
@@ -454,23 +514,16 @@ async def notify(txn_id: str, channel: str, message: str) -> None:
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
     gmail_address = os.getenv("GMAIL_ADDRESS")
     gmail_app_password = os.getenv("GMAIL_APP_PASSWORD")
-
-    # If SMTP isn't fully configured, skip sending — the audit event already
-    # succeeded, so this is not an error.
-    if not (gmail_address and gmail_app_password and recipient):
-        print("notify: SMTP not configured, skipping send")
+    if not (gmail_address and gmail_app_password and recipients):
+        print("notify: SMTP not configured or no recipients resolved; skipping send")
         return
 
     msg = EmailMessage()
     # The [invoice-<txn_id>] tag ties replies back to this run (email adapter 9.3).
     msg["Subject"] = f"[invoice-{txn_id}] {message}"
     msg["From"] = gmail_address
-    msg["To"] = recipient
-    if is_rejection:
-        body = f"Your invoice was rejected.\n\nReason: {reason or 'No reason was recorded.'}"
-    else:
-        body = f"{message}\n\nReply to this email with one of: approve / reject / return."
-    msg.set_content(body)
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(f"{message}\n\nReply to this email with your decision (e.g. approve / reject / return).")
 
     try:
         with smtplib.SMTP(smtp_host, smtp_port) as server:

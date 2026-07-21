@@ -49,7 +49,7 @@ from invoice_activities import (  # noqa: E402  (import after sys.path tweak)
     post_to_erp,
     set_transaction_status,
 )
-from invoice_workflow import InvoiceWorkflow  # noqa: E402
+from process_interpreter import ProcessInterpreterWorkflow  # noqa: E402  (generic engine)
 
 
 async def main():
@@ -61,7 +61,7 @@ async def main():
     worker_main = Worker(
         client,
         task_queue="invoice-tq",
-        workflows=[InvoiceWorkflow],
+        workflows=[ProcessInterpreterWorkflow],
         activities=[append_event, extract_fields, create_human_task, notify, post_to_erp, set_transaction_status],
         activity_executor=ThreadPoolExecutor(max_workers=8),
     )

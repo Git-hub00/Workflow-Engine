@@ -34,7 +34,7 @@ for _sub in ("workflows", "activities"):
     if str(_d) not in sys.path:
         sys.path.insert(0, str(_d))
 
-from invoice_workflow import InvoiceWorkflow  # noqa: E402  (after sys.path tweak)
+from process_interpreter import ProcessInterpreterWorkflow  # noqa: E402  (generic engine)
 
 # Module-level SQLAlchemy engine: created once, connection-pooled, reused by every
 # request. (These calls are synchronous/blocking; fine for the MVP. Under real
@@ -326,9 +326,11 @@ async def create_transaction(body: TransactionIn, user: dict | None = Depends(_o
     # 3. Start the Temporal workflow, using the transaction id as the workflow id
     #    (one workflow per transaction). The reused app.state.temporal client
     #    dispatches to the main "invoice-tq" queue the worker polls.
+    # Start the GENERIC interpreter with the full PDD (nodes/edges). The interpreter
+    # derives cfg/roles from it and walks the graph — invoice is just one PDD.
     await app.state.temporal.start_workflow(
-        InvoiceWorkflow.run,
-        args=[txn_id, cfg],
+        ProcessInterpreterWorkflow.run,
+        args=[txn_id, pdd],
         id=txn_id,
         task_queue="invoice-tq",
     )
