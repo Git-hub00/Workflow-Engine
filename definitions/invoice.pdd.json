@@ -1,6 +1,7 @@
 {
   "process_key": "invoice_approval",
   "version": 1,
+  "roles": { "review": "vendor", "manager": "ap_manager", "finance": "finance" },
   "config": {
     "autoApproveUnder": 500,
     "financeThreshold": 5000,
@@ -10,5 +11,94 @@
     "slaHours": 48,
     "approvedVendors": ["Acme Supplies", "Globex Inc", "Initech", "Northwind Traders"]
   },
-  "roles": { "review": "vendor", "manager": "ap_manager", "finance": "finance" }
+  "data_schema": {
+    "vendor": "string",
+    "amount": "number",
+    "poNumber": "string",
+    "costCenter": "string",
+    "taxId": "string"
+  },
+  "extraction": {
+    "source": "pdf",
+    "fields": ["vendor", "amount", "poNumber", "costCenter", "taxId"]
+  },
+  "notifications": [
+    { "on": "task_created:manager", "to_role": "manager", "template": "Action needed: manager approval" },
+    { "on": "task_created:finance", "to_role": "finance", "template": "Action needed: finance approval" },
+    { "on": "task_created:request_info", "to": "submitter", "template": "More info needed on your invoice: please provide {missing}." },
+    { "on": "completed:approved", "to": "submitter", "template": "Your invoice was approved." },
+    { "on": "completed:rejected", "to": "submitter", "template": "Your invoice was rejected: {reason}" }
+  ],
+  "nodes": [
+    { "id": "start", "type": "start", "next": "extract" },
+    { "id": "extract", "type": "automated", "action": "extract_fields", "next": "review" },
+    {
+      "id": "review",
+      "type": "llm_decision",
+      "routes": [
+        { "edge": "REQUEST_INFO", "when": "missing(requiredFields)" },
+        { "edge": "AUTO_APPROVE", "when": "amount < config.autoApproveUnder && !anomaly" },
+        { "edge": "MANAGER_THEN_FINANCE", "when": "amount >= config.financeThreshold || anomaly" },
+        { "edge": "MANAGER_ONLY", "when": "default" }
+      ],
+      "edges": {
+        "REQUEST_INFO": "request_info",
+        "AUTO_APPROVE": "finalize",
+        "MANAGER_ONLY": "manager",
+        "MANAGER_THEN_FINANCE": "manager"
+      }
+    },
+    {
+      "id": "request_info",
+      "type": "human_task",
+      "assignment": { "role": "review" },
+      "form_schema": {
+        "fields": [
+          { "key": "poNumber", "type": "string", "required": true },
+          { "key": "costCenter", "type": "string", "required": true },
+          { "key": "taxId", "type": "string", "required": true }
+        ]
+      },
+      "timeout": { "slaHours": 48, "calendar": "business_default", "on_timeout": "remind" },
+      "next": "review"
+    },
+    {
+      "id": "manager",
+      "type": "human_task",
+      "assignment": { "role": "manager" },
+      "form_schema": {
+        "fields": [
+          { "key": "decision", "type": "enum", "values": ["approve", "reject", "return"], "required": true },
+          { "key": "reason", "type": "string", "required": false }
+        ]
+      },
+      "timeout": { "slaHours": 48, "calendar": "business_default", "on_timeout": "remind" },
+      "edges": [
+        { "when": "decision == 'reject'", "to": "end_rejected" },
+        { "when": "decision == 'return'", "to": "request_info" },
+        { "when": "route == 'MANAGER_THEN_FINANCE'", "to": "finance" },
+        { "when": "default", "to": "finalize" }
+      ]
+    },
+    {
+      "id": "finance",
+      "type": "human_task",
+      "assignment": { "role": "finance" },
+      "completion": { "mode": "quorum", "n": 2, "of": 3, "rejectShortCircuits": true },
+      "form_schema": {
+        "fields": [
+          { "key": "decision", "type": "enum", "values": ["approve", "reject"], "required": true },
+          { "key": "reason", "type": "string", "required": false }
+        ]
+      },
+      "timeout": { "slaHours": 48, "calendar": "business_default", "on_timeout": "remind" },
+      "edges": [
+        { "when": "quorum_approved", "to": "finalize" },
+        { "when": "default", "to": "end_rejected" }
+      ]
+    },
+    { "id": "finalize", "type": "automated", "action": "post_to_erp", "next": "end_approved" },
+    { "id": "end_approved", "type": "end", "outcome": "approved" },
+    { "id": "end_rejected", "type": "end", "outcome": "rejected" }
+  ]
 }

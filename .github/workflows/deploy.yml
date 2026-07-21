@@ -78,6 +78,6 @@ jobs:
             chmod 600 services/api/.env
             echo "Wrote services/api/.env ($(wc -l < services/api/.env) lines)"
 
-            # --- run the idempotent deploy on the VM ---
-            echo "Running $HOME/LangGraph_Durable_Workflow_Engine/scripts/deploy_vm.sh"
-            export VM_HOST="${{ vars.VM_HOST }}"; bash "$HOME/LangGraph_Durable_Workflow_Engine/scripts/deploy_vm.sh"
+            # --- run the idempotent deploy on the VM (Dockerized app tier) ---
+            echo "Running $HOME/LangGraph_Durable_Workflow_Engine/scripts/deploy_docker.sh"
+            export VM_HOST="${{ vars.VM_HOST }}"; bash "$HOME/LangGraph_Durable_Workflow_Engine/scripts/deploy_docker.sh"

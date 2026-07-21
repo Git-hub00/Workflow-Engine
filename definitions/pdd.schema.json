@@ -1,0 +1,156 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://certainti.ai/schemas/pdd.schema.json",
+  "title": "Process Definition Document (PDD)",
+  "description": "The contract for a configurable business process. One generic engine interprets any document that conforms to this schema. Invoice approval is one example.",
+  "type": "object",
+  "required": ["process_key", "version", "roles", "nodes"],
+  "additionalProperties": true,
+  "properties": {
+    "process_key": {
+      "type": "string",
+      "description": "Stable business identity of the process, e.g. 'invoice_approval'."
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Definition version. In-flight transactions stay pinned to the version they started on."
+    },
+    "roles": {
+      "type": "object",
+      "description": "Maps logical role names used inside the PDD to real Keycloak realm roles.",
+      "additionalProperties": { "type": "string" },
+      "examples": [{ "review": "vendor", "manager": "ap_manager", "finance": "finance" }]
+    },
+    "config": {
+      "type": "object",
+      "description": "Tunable values referenced by node conditions (thresholds, quorum, SLA, etc.). Editable without changing the graph.",
+      "additionalProperties": true
+    },
+    "data_schema": {
+      "type": "object",
+      "description": "The business fields a transaction of this process carries. Drives the dynamic Start form in the UI and validation. Stored in transaction.data_snapshot (JSONB) — no per-process table.",
+      "additionalProperties": true
+    },
+    "extraction": {
+      "type": "object",
+      "description": "Optional document-extraction spec for an 'automated' extract node: which fields to pull and from what source.",
+      "properties": {
+        "source": { "type": "string", "enum": ["pdf", "none"], "default": "none" },
+        "fields": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": true
+    },
+    "notifications": {
+      "type": "array",
+      "description": "Rules mapping an event to a recipient and a message template. Replaces hardcoded recipient logic.",
+      "items": {
+        "type": "object",
+        "required": ["on", "template"],
+        "properties": {
+          "on": { "type": "string", "description": "Event key, e.g. 'task_created:manager', 'completed:approved'." },
+          "to_role": { "type": "string", "description": "Logical role (key of the roles map) to notify." },
+          "to": { "type": "string", "description": "Special target such as 'submitter'." },
+          "template": { "type": "string", "description": "Message text; may contain {placeholders} like {reason}." }
+        },
+        "additionalProperties": true
+      }
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 2,
+      "description": "The process graph. Exactly one 'start' and at least one 'end'.",
+      "items": { "$ref": "#/definitions/node" }
+    }
+  },
+  "definitions": {
+    "node": {
+      "type": "object",
+      "required": ["id", "type"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": {
+          "type": "string",
+          "enum": ["start", "end", "automated", "llm_decision", "human_task", "gateway_exclusive", "gateway_fork", "gateway_join", "timer"]
+        },
+        "next": { "type": "string", "description": "Single successor node id (for linear nodes)." },
+        "action": { "type": "string", "description": "For 'automated' nodes: the registered action to run, e.g. 'extract_fields', 'post_to_erp'." },
+        "outcome": { "type": "string", "description": "For 'end' nodes: terminal outcome recorded on the transaction, e.g. 'approved'." },
+        "assignment": {
+          "type": "object",
+          "description": "For 'human_task': who the task goes to.",
+          "required": ["role"],
+          "properties": { "role": { "type": "string", "description": "Logical role name (key of the roles map)." } }
+        },
+        "form_schema": {
+          "type": "object",
+          "description": "For 'human_task': the fields the UI renders for the human to fill.",
+          "properties": {
+            "fields": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["key"],
+                "properties": {
+                  "key": { "type": "string" },
+                  "type": { "type": "string", "enum": ["string", "number", "enum", "boolean"], "default": "string" },
+                  "values": { "type": "array", "items": { "type": "string" } },
+                  "required": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        "completion": {
+          "type": "object",
+          "description": "For multi-participant 'human_task': completion policy.",
+          "properties": {
+            "mode": { "type": "string", "enum": ["all", "any", "quorum"] },
+            "n": { "type": "integer" },
+            "of": { "type": "integer" },
+            "rejectShortCircuits": { "type": "boolean" }
+          }
+        },
+        "timeout": {
+          "type": "object",
+          "description": "SLA/escalation for a node.",
+          "properties": {
+            "slaHours": { "type": "number" },
+            "calendar": { "type": "string" },
+            "on_timeout": { "type": "string", "enum": ["remind", "escalate", "auto_approve", "auto_reject", "wait"] }
+          }
+        },
+        "routes": {
+          "type": "array",
+          "description": "For 'llm_decision': the bounded set of outcomes the model may choose among (hard rail).",
+          "items": {
+            "type": "object",
+            "required": ["edge"],
+            "properties": {
+              "edge": { "type": "string" },
+              "when": { "type": "string", "description": "Optional deterministic guardrail condition." }
+            }
+          }
+        },
+        "edges": {
+          "description": "Successor mapping. Either an object {EDGE_NAME: node_id} (for llm_decision) or a list of {when, to} (for conditional branches).",
+          "oneOf": [
+            { "type": "object", "additionalProperties": { "type": "string" } },
+            {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["to"],
+                "properties": {
+                  "when": { "type": "string" },
+                  "to": { "type": "string" }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}
