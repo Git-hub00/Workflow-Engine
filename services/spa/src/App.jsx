@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { get, post, put, upload } from './api'
 import keycloak from './keycloak'
 import { uuid } from './uuid'
-import { StartProcess, GenericTaskForm } from './generic'
+import { StartProcess, GenericTaskForm, ProcessFlowDynamic } from './generic'
 import './App.css'
 
 const PROCESS_KEY = 'invoice_approval'
@@ -1919,7 +1919,7 @@ function App() {
             {activeTab === 'tasks' && <TaskInbox roles={roles} username={username} />}
             {activeTab === 'monitor' && <Monitor />}
             {activeTab === 'configuration' && <Configuration canEdit={roles.includes('process_author')} />}
-            {activeTab === 'flow' && <ProcessFlow />}
+            {activeTab === 'flow' && <ProcessFlowDynamic />}
             {activeTab === 'start' && <StartProcess />}
           </>
         )}
