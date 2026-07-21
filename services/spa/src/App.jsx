@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { get, post, put, upload } from './api'
 import keycloak from './keycloak'
 import { uuid } from './uuid'
+import { StartProcess } from './generic'
 import './App.css'
 
 const PROCESS_KEY = 'invoice_approval'
@@ -11,6 +12,7 @@ const tabs = [
   { id: 'monitor', label: 'Monitor' },
   { id: 'configuration', label: 'Configuration' },
   { id: 'flow', label: 'Process Flow' },
+  { id: 'start', label: 'Start Process' },
 ]
 
 const monitorKpis = [
@@ -1839,6 +1841,7 @@ function App() {
             {activeTab === 'monitor' && <Monitor />}
             {activeTab === 'configuration' && <Configuration canEdit={roles.includes('process_author')} />}
             {activeTab === 'flow' && <ProcessFlow />}
+            {activeTab === 'start' && <StartProcess />}
           </>
         )}
       </main>

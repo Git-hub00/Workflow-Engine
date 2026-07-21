@@ -17,7 +17,7 @@ from pathlib import Path
 import jwt
 import requests
 from jwt import PyJWKClient
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
@@ -304,8 +304,11 @@ async def create_transaction(body: TransactionIn, user: dict | None = Depends(_o
     # role mappings at the top level, but the workflow expects cfg["roles"] too,
     # so we fold roles into the config dict (same shape the e2e test used).
     pdd = row["pdd"]  # jsonb -> dict (psycopg)
-    cfg = {**pdd["config"], "roles": pdd["roles"]}
-    _validate_author_finance_config(cfg)
+    cfg = {**pdd.get("config", {}), "roles": pdd.get("roles", {})}
+    # Only enforce the finance-quorum config when this process actually uses a
+    # quorum node — a process with no finance approval needs no quorum config.
+    if any((n.get("completion") or {}).get("mode") == "quorum" for n in pdd.get("nodes", [])):
+        _validate_author_finance_config(cfg)
 
     # 2. Create the transaction row in ONE transaction: new uuid, linked to the
     #    resolved definition_version, status 'running', snapshot = posted data.
@@ -345,21 +348,43 @@ async def create_transaction(body: TransactionIn, user: dict | None = Depends(_o
     return {"transaction_id": txn_id}
 
 
-# WHY POST /v1/extract-invoice: vendor portal PDF assist. Reads the PDF text and
-# asks the SAME Ollama model ai_review uses (LLM_BASE_URL / LLM_MODEL, api_key
-# "ollama") to pull invoice fields as JSON. It NEVER creates a transaction and
-# NEVER 500s — on any failure it returns {"fields": {}, "error": ...} (200) so the
-# vendor can still fill the form by hand.
+# WHY POST /v1/extract (and legacy alias /v1/extract-invoice): document-upload
+# assist for ANY process. Reads the PDF text and asks the LLM to pull the fields
+# the process's PDD declares (extraction.fields, else data_schema keys). It NEVER
+# creates a transaction and NEVER 500s — on any failure it returns
+# {"fields": {}, "error": ...} (200) so the user can still fill the form by hand.
+def _pdd_extract_fields(process_key: str) -> list:
+    with engine.connect() as conn:
+        pdd = conn.execute(
+            text("SELECT dv.pdd FROM definition_version dv "
+                 "JOIN process_definition pd ON pd.id = dv.definition_id "
+                 "WHERE pd.process_key = :pk AND dv.status = 'published' "
+                 "ORDER BY dv.version DESC LIMIT 1"),
+            {"pk": process_key},
+        ).scalar_one_or_none()
+    if isinstance(pdd, dict):
+        ext = pdd.get("extraction") or {}
+        if isinstance(ext.get("fields"), list) and ext["fields"]:
+            return ext["fields"]
+        data_schema = pdd.get("data_schema")
+        if isinstance(data_schema, dict) and data_schema:
+            return list(data_schema.keys())
+    return ["vendor", "amount", "poNumber", "costCenter", "taxId"]  # invoice default
+
+
+@app.post("/v1/extract")
 @app.post("/v1/extract-invoice")
-async def extract_invoice(file: UploadFile = File(...)):
+async def extract_document(file: UploadFile = File(...),
+                           process_key: str = Form("invoice_approval")):
     raw = await file.read()
+    fields = _pdd_extract_fields(process_key)
     # Blocking work (pypdf + LLM HTTP) runs on a thread so a slow model can NEVER
     # stall the API event loop for other requests.
     import asyncio
-    return await asyncio.to_thread(_extract_invoice_sync, raw)
+    return await asyncio.to_thread(_extract_document_sync, raw, fields)
 
 
-def _extract_invoice_sync(raw: bytes):
+def _extract_document_sync(raw: bytes, fields: list):
     import io
     import re
     from pypdf import PdfReader
@@ -374,11 +399,12 @@ def _extract_invoice_sync(raw: bytes):
     if not text_content.strip():
         return {"fields": {}, "error": "no extractable text in PDF", "raw_text_len": 0}
 
+    field_list = ", ".join(fields) if fields else "all relevant fields"
     try:
         client = OpenAI(
             base_url=os.getenv("LLM_BASE_URL", "http://localhost:11434/v1"),
             api_key="ollama",
-            timeout=45,  # never hang on a slow/cold 1b model; falls to {fields:{}, error}
+            timeout=45,  # never hang on a slow/cold model; falls to {fields:{}, error}
         )
         completion = client.chat.completions.create(
             model=os.getenv("LLM_MODEL", "llama3.2:1b"),
@@ -387,9 +413,9 @@ def _extract_invoice_sync(raw: bytes):
                 {
                     "role": "user",
                     "content": (
-                        "Extract these fields as JSON only: vendor, amount, poNumber, "
-                        "costCenter, taxId. Use null for anything not found. Output ONLY JSON.\n\n"
-                        f"Invoice text:\n{text_content[:6000]}"
+                        f"Extract these fields as JSON only: {field_list}. "
+                        "Use null for anything not found. Output ONLY JSON.\n\n"
+                        f"Document text:\n{text_content[:6000]}"
                     ),
                 }
             ],
@@ -408,8 +434,8 @@ def _extract_invoice_sync(raw: bytes):
     if not isinstance(parsed, dict):
         return {"fields": {}, "error": "LLM did not return a JSON object", "raw_text_len": len(text_content)}
 
-    fields = {key: parsed.get(key) for key in ("vendor", "amount", "poNumber", "costCenter", "taxId")}
-    return {"fields": fields, "raw_text_len": len(text_content)}
+    fields_out = {key: parsed.get(key) for key in fields}
+    return {"fields": fields_out, "raw_text_len": len(text_content)}
 
 
 # WHY EventIn: the request contract for the Event Ingress (Section 9.2) — the way
@@ -1053,7 +1079,9 @@ class ConfigIn(BaseModel):
 # stays open. require_role() 403s callers without the role (and 401s no/invalid token).
 @app.put("/v1/config/{process_key}")
 async def put_config(process_key: str, body: ConfigIn, user: dict = Depends(require_role("process_author"))):
-    _validate_author_finance_config(body.config)
+    # Validate the finance quorum only if this config actually carries one.
+    if body.config.get("quorum") is not None:
+        _validate_author_finance_config(body.config)
     with engine.connect() as conn:
         row = conn.execute(
             text(
