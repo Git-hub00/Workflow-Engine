@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { get, post, put, upload } from './api'
 import keycloak from './keycloak'
 import { uuid } from './uuid'
-import { StartProcess } from './generic'
+import { StartProcess, GenericTaskForm } from './generic'
 import './App.css'
 
 const PROCESS_KEY = 'invoice_approval'
@@ -101,6 +101,8 @@ function TaskInbox({ roles, username }) {
   // rejectDrafts[token] !== undefined => the required-reason reject form is open
   // for that task; its value is the typed reason text.
   const [rejectDrafts, setRejectDrafts] = useState({})
+  const [pdds, setPdds] = useState({})            // process_key -> PDD (for form_schema)
+  const [taskDrafts, setTaskDrafts] = useState({}) // token -> {field: value} for generic forms
   const [feedback, setFeedback] = useState({})
   const [busyAction, setBusyAction] = useState('')
   const [loading, setLoading] = useState(true)
@@ -140,6 +142,7 @@ function TaskInbox({ roles, username }) {
       const transactionIds = [...new Set(taskRows.map((task) => task.transaction_id))]
       const detailEntries = await Promise.all(
         transactionIds.map(async (transactionId) => {
+          const processKey = transactionById[transactionId]?.process_key ?? null
           try {
             const history = await get(`/v1/transactions/${encodeURIComponent(transactionId)}/history`)
             return [
@@ -148,6 +151,7 @@ function TaskInbox({ roles, username }) {
                 invoice: transactionById[transactionId]?.data_snapshot ?? null,
                 history,
                 error: '',
+                process_key: processKey,
               },
             ]
           } catch (error) {
@@ -157,12 +161,27 @@ function TaskInbox({ roles, username }) {
                 invoice: transactionById[transactionId]?.data_snapshot ?? null,
                 history: [],
                 error: apiErrorMessage(error),
+                process_key: processKey,
               },
             ]
           }
         }),
       )
       setDetails(Object.fromEntries(detailEntries))
+
+      // Fetch each process's PDD once so task action forms can render from the
+      // node's form_schema (falls back to the classic approve/reject UI).
+      const processKeys = [...new Set(transactionRows.map((t) => t.process_key).filter(Boolean))]
+      const pddEntries = await Promise.all(
+        processKeys.map(async (pk) => {
+          try {
+            return [pk, await get(`/v1/definitions/${encodeURIComponent(pk)}`)]
+          } catch {
+            return [pk, null]
+          }
+        }),
+      )
+      setPdds(Object.fromEntries(pddEntries))
     } catch (error) {
       setLoadError(apiErrorMessage(error))
     } finally {
@@ -264,6 +283,50 @@ function TaskInbox({ roles, username }) {
     }
   }
 
+  // Resolve a task's action form from the process PDD's node.form_schema. Returns
+  // null when unavailable -> the classic approve/reject UI is used as a fallback.
+  function formSchemaFor(task) {
+    const processKey = details[task.transaction_id]?.process_key
+    const pdd = processKey ? pdds[processKey] : null
+    if (!pdd || !Array.isArray(pdd.nodes)) return null
+    const node = pdd.nodes.find((n) => n.id === task.node_id)
+    const fields = node?.form_schema?.fields
+    return Array.isArray(fields) && fields.length ? fields : null
+  }
+
+  async function submitGenericTask(task, fields) {
+    const values = taskDrafts[task.token] || {}
+    const missing = fields.filter((f) => f.required && !values[f.key])
+    if (missing.length) {
+      setFeedback((current) => ({
+        ...current,
+        [task.token]: { type: 'error', message: `Please fill: ${missing.map((f) => f.key).join(', ')}` },
+      }))
+      return
+    }
+    setBusyAction(`${task.token}:complete`)
+    setFeedback((current) => ({ ...current, [task.token]: null }))
+    try {
+      await post(`/v1/tasks/${encodeURIComponent(task.token)}/complete`, {
+        idempotency_key: uuid(),
+        payload: { ...values },
+        kind: 'human',
+      })
+      setTasks((current) => current.filter((item) => item.token !== task.token))
+      setFeedback((current) => ({
+        ...current,
+        [task.token]: { type: 'success', message: 'Decision submitted.' },
+      }))
+    } catch (error) {
+      setFeedback((current) => ({
+        ...current,
+        [task.token]: { type: 'error', message: apiErrorMessage(error) },
+      }))
+    } finally {
+      setBusyAction('')
+    }
+  }
+
   return (
     <section className="view" aria-labelledby="task-inbox-heading">
       <div className="view-heading">
@@ -311,6 +374,8 @@ function TaskInbox({ roles, username }) {
             latestLlmDecision?.payload?.detail
           const isFinanceTask = task.node_id === 'finance'
           const isClaimedByUser = task.status === 'claimed' && task.claimed_by === username
+          // Generic form fields from the PDD (non-finance only; finance keeps the quorum widget).
+          const taskFields = isFinanceTask ? null : formSchemaFor(task)
           const canSubmitFinanceDecision =
             task.current_user_claimed && !task.current_user_decision && task.can_decide
           // Did GET /v1/tasks actually enrich this finance task with quorum fields?
@@ -495,7 +560,21 @@ function TaskInbox({ roles, username }) {
                       typed reason (recorded in the audit + vendor email). The
                       workflow's "return" branch still exists in the backend; it is
                       intentionally not exposed in this UI. */}
-                  {isClaimedByUser &&
+                  {isClaimedByUser && taskFields && (
+                    <GenericTaskForm
+                      fields={taskFields}
+                      values={taskDrafts[task.token] || {}}
+                      onChange={(key, value) =>
+                        setTaskDrafts((current) => ({
+                          ...current,
+                          [task.token]: { ...(current[task.token] || {}), [key]: value },
+                        }))
+                      }
+                      onSubmit={() => submitGenericTask(task, taskFields)}
+                      busy={busyAction === `${task.token}:complete`}
+                    />
+                  )}
+                  {isClaimedByUser && !taskFields &&
                     (rejectDrafts[task.token] === undefined ? (
                       <div className="finance-vote-buttons">
                         <button

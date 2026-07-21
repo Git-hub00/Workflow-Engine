@@ -49,6 +49,26 @@ export function DynamicForm({ fields, values, onChange, disabled = false }) {
   )
 }
 
+// Renders a human task's action form from its node.form_schema and submits the
+// collected values. Used by the Task Inbox (slice 2) for non-quorum tasks.
+export function GenericTaskForm({ fields, values, onChange, onSubmit, busy = false }) {
+  return (
+    <form
+      className="reject-reason-form"
+      onSubmit={(event) => {
+        event.preventDefault()
+        onSubmit()
+      }}
+    >
+      <DynamicForm fields={fields} values={values} onChange={onChange} disabled={busy} />
+      <button className="primary-button" type="submit" disabled={busy}>
+        {busy ? 'Submitting…' : 'Submit'}
+      </button>
+    </form>
+  )
+}
+
+
 // Catalog + generic launcher: pick a published process, fill the form built from
 // its data_schema (optionally auto-filled from a PDF), and start a transaction.
 export function StartProcess() {
