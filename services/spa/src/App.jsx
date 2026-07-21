@@ -3,6 +3,7 @@ import { get, post, put, upload } from './api'
 import keycloak from './keycloak'
 import { uuid } from './uuid'
 import { StartProcess, GenericTaskForm, ProcessFlowDynamic } from './generic'
+import { ProcessBuilder } from './builder'
 import './App.css'
 
 const PROCESS_KEY = 'invoice_approval'
@@ -1859,12 +1860,14 @@ function App() {
     username
   // Vendors get a restricted portal (Send Invoice + Inbox only); everyone else
   // keeps the full operator UI. Hidden tabs are NOT rendered for vendors.
+  // process_author additionally gets the design-time Builder tab.
+  const operatorTabs = roles.includes('process_author') ? [...tabs, { id: 'builder', label: 'Builder' }] : tabs
   const navTabs = isVendor
     ? [
         { id: 'send', label: 'Send Invoice' },
         { id: 'inbox', label: 'Inbox' },
       ]
-    : tabs
+    : operatorTabs
   const [activeTab, setActiveTab] = useState(navTabs[0].id)
 
   return (
@@ -1921,6 +1924,7 @@ function App() {
             {activeTab === 'configuration' && <Configuration canEdit={roles.includes('process_author')} />}
             {activeTab === 'flow' && <ProcessFlowDynamic />}
             {activeTab === 'start' && <StartProcess />}
+            {activeTab === 'builder' && <ProcessBuilder />}
           </>
         )}
       </main>

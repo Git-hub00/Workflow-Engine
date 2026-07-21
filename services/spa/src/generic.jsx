@@ -297,6 +297,70 @@ function computeLayout(pdd) {
   }
 }
 
+// Pure diagram from a PDD object (used by the Builder's live preview). Renders a
+// hint until there are nodes to lay out.
+export function FlowDiagram({ pdd }) {
+  const layout = pdd && Array.isArray(pdd.nodes) && pdd.nodes.length ? computeLayout(pdd) : null
+  if (!layout) return <p className="muted">Add a start node and steps to see the diagram.</p>
+  return (
+    <div className="flow-canvas" style={{ overflowX: 'auto' }}>
+      <svg
+        viewBox={`0 0 ${layout.width} ${layout.height}`}
+        width={layout.width}
+        height={layout.height}
+        role="img"
+        aria-label="Process flow diagram"
+      >
+        <defs>
+          <marker id="bld-arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <polygon points="0 0, 9 3.5, 0 7" fill="#94a3b8" />
+          </marker>
+        </defs>
+        {layout.links.map((link, idx) => {
+          const a = layout.pos[link.from]
+          const b = layout.pos[link.to]
+          if (!a || !b) return null
+          const x1 = a.x + layout.BW
+          const y1 = a.y + layout.BH / 2
+          const x2 = b.x
+          const y2 = b.y + layout.BH / 2
+          const mx = (x1 + x2) / 2
+          const d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`
+          const label = link.label && link.label.length > 16 ? `${link.label.slice(0, 15)}…` : link.label
+          return (
+            <g key={`bld-e-${idx}`}>
+              <path d={d} fill="none" stroke="#94a3b8" strokeWidth="1.3" markerEnd="url(#bld-arrow)" />
+              {label && (
+                <text x={mx} y={(y1 + y2) / 2 - 4} textAnchor="middle" fontSize="10" fill="#64748b">{label}</text>
+              )}
+            </g>
+          )
+        })}
+        {layout.nodes.map((n) => {
+          const p = layout.pos[n.id]
+          if (!p) return null
+          return (
+            <g key={n.id}>
+              <rect
+                x={p.x}
+                y={p.y}
+                width={layout.BW}
+                height={layout.BH}
+                rx="12"
+                fill={NODE_FILL[n.type] || '#f1f5f9'}
+                stroke={NODE_STROKE[n.type] || '#cbd5e1'}
+                strokeWidth="1.5"
+              />
+              <text x={p.x + layout.BW / 2} y={p.y + 24} textAnchor="middle" fontSize="13" fontWeight="600" fill="#1e293b">{n.id}</text>
+              <text x={p.x + layout.BW / 2} y={p.y + 42} textAnchor="middle" fontSize="10" fill="#64748b">{n.type}</text>
+            </g>
+          )
+        })}
+      </svg>
+    </div>
+  )
+}
+
 export function ProcessFlowDynamic() {
   const [processes, setProcesses] = useState([])
   const [selected, setSelected] = useState('')
