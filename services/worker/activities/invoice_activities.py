@@ -363,6 +363,8 @@ def _submitted_by_email(txn_id: str) -> str | None:
         ).scalar_one_or_none()
     if not submitted_by:
         return None
+    if "@" in submitted_by:
+        return submitted_by  # already an email address (e.g. an email-started transaction)
     try:
         kc = os.getenv("KEYCLOAK_URL", "http://localhost:8081")
         realm = os.getenv("KEYCLOAK_REALM", "workflow")

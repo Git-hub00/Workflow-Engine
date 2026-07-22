@@ -120,75 +120,99 @@ def _pdf_attachment(msg):
     return None
 
 
-def _vendor_for_sender(sender: str) -> str | None:
-    # Identify the vendor by SENDER email via the Keycloak admin API (admin-cli
-    # token from the master realm — the same pattern used elsewhere). Returns the
-    # username of the vendor-role user whose email matches, else None. Raises on
-    # Keycloak errors so the caller keeps the mail UNSEEN and retries.
-    kc = os.getenv("KEYCLOAK_URL", "http://localhost:8081")
-    realm = os.getenv("KEYCLOAK_REALM", "workflow")
-    admin = os.getenv("KEYCLOAK_ADMIN", "admin")
-    password = os.getenv("KEYCLOAK_ADMIN_PASSWORD", "admin")
-    token = requests.post(
-        f"{kc}/realms/master/protocol/openid-connect/token",
-        data={"client_id": "admin-cli", "grant_type": "password", "username": admin, "password": password},
-        timeout=10,
-    ).json().get("access_token")
-    if not token:
-        raise RuntimeError("Keycloak admin token unavailable")
-    users = requests.get(
-        f"{kc}/admin/realms/{realm}/roles/vendor/users",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=10,
-    ).json()
-    for user in users if isinstance(users, list) else []:
-        if sender and (user.get("email") or "").strip().lower() == sender:
-            return user.get("username")
+_START_RE = re.compile(r"\[start:([A-Za-z0-9_\-]+)\]", re.IGNORECASE)
+
+
+def _process_from_subject(subject: str):
+    m = _START_RE.search(subject or "")
+    return m.group(1) if m else None
+
+
+def _get_pdd(api_base_url: str, process_key: str):
+    try:
+        r = requests.get(f"{api_base_url}/v1/definitions/{process_key}", timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
     return None
 
 
-def _process_new_invoice(msg, api_base_url: str) -> str:
-    # A fresh invoice arriving by email (no [invoice-<uuid>] tag): identify the
-    # vendor by sender, extract the PDF via the SAME /v1/extract-invoice endpoint,
-    # and create the transaction with submitted_by = the matched vendor username.
-    attachment = _pdf_attachment(msg)
-    if attachment is None:
-        return "skipped (no [invoice-] tag and no PDF attachment)"
+def _process_for_mailbox(api_base_url: str, mailbox_name: str):
+    # Find the published process whose PDD is bound to this mailbox (pdd.mailbox).
+    try:
+        defs = requests.get(f"{api_base_url}/v1/definitions", timeout=10).json()
+    except Exception:
+        return None, None
+    for d in defs if isinstance(defs, list) else []:
+        pk = d.get("process_key")
+        pdd = _get_pdd(api_base_url, pk)
+        if pdd and pdd.get("mailbox") == mailbox_name:
+            return pk, pdd
+    return None, None
+
+
+def _parse_body_fields(body: str, field_names) -> dict:
+    # Parse "field: value" lines, matched case-insensitively to the process's
+    # data_schema field names.
+    wanted = {name.lower(): name for name in (field_names or [])}
+    out = {}
+    for line in (body or "").splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        canon = wanted.get(key.strip().lower())
+        if canon and value.strip():
+            out[canon] = value.strip()
+    return out
+
+
+def _process_new_transaction(msg, api_base_url: str, mailbox_name: str) -> str:
+    # GENERIC email intake: start ANY process from an inbound email. The process is
+    # chosen by a "[start:<process_key>]" subject tag, or by the process bound to
+    # this mailbox (pdd.mailbox). Fields come from a PDF attachment (via the PDD's
+    # extraction) and/or "field: value" body lines. NEVER raises.
+    subject = decode_subject(msg.get("Subject", ""))
     sender = _sender_email(msg)
-    try:
-        vendor_user = _vendor_for_sender(sender)
-    except Exception as exc:
-        return f"error: Keycloak lookup failed: {exc}"
-    if not vendor_user:
-        return f"skipped (unknown sender {sender!r})"
 
-    filename, pdf_bytes = attachment
-    try:
-        extracted = requests.post(
-            f"{api_base_url}/v1/extract-invoice",
-            files={"file": (filename, pdf_bytes, "application/pdf")},
-            timeout=60,
-        ).json()
-    except Exception as exc:
-        # Extraction is BEST-EFFORT: on failure/timeout still create the invoice
-        # (vendor from sender) so the workflow's request_info can gather fields.
-        print(f"new-invoice: extract failed, creating anyway: {exc}")
-        extracted = {}
+    process_key = _process_from_subject(subject)
+    pdd = _get_pdd(api_base_url, process_key) if process_key else None
+    if process_key and pdd is None:
+        return f"skipped (subject names unknown process {process_key!r}) status=none"
+    if not process_key:
+        process_key, pdd = _process_for_mailbox(api_base_url, mailbox_name)
+    if not process_key:
+        return ("skipped (no process to start: add '[start:<process_key>]' to the subject, "
+                f"or bind a process to mailbox {mailbox_name!r}) status=none")
 
-    data = {key: value for key, value in (extracted.get("fields") or {}).items() if value is not None}
-    data.setdefault("vendor", vendor_user)  # fall back to the matched vendor
-    amount = data.get("amount")
-    if isinstance(amount, str):
+    data_schema = (pdd or {}).get("data_schema") or {}
+
+    data = {}
+    attachment = _pdf_attachment(msg)
+    if attachment:
+        filename, pdf_bytes = attachment
         try:
-            amount = float(re.sub(r"[^0-9.]", "", amount) or 0)
-        except Exception:
-            amount = 0
-    data["amount"] = amount if isinstance(amount, (int, float)) else 0
+            extracted = requests.post(
+                f"{api_base_url}/v1/extract",
+                files={"file": (filename, pdf_bytes, "application/pdf")},
+                data={"process_key": process_key}, timeout=120,
+            ).json()
+            data.update({k: v for k, v in (extracted.get("fields") or {}).items() if v is not None})
+        except Exception as exc:
+            print(f"intake: extract failed, continuing: {exc}")
+    data.update(_parse_body_fields(_extract_body(msg), list(data_schema.keys())))
+
+    for name, typ in data_schema.items():
+        if typ == "number" and isinstance(data.get(name), str):
+            try:
+                data[name] = float(re.sub(r"[^0-9.\-]", "", data[name]) or 0)
+            except Exception:
+                data[name] = 0
 
     try:
         resp = requests.post(
             f"{api_base_url}/v1/transactions",
-            json={"process_key": "invoice_approval", "data": data, "submitted_by": vendor_user},
+            json={"process_key": process_key, "data": data, "submitted_by": sender or None},
             timeout=30,
         )
     except Exception as exc:
@@ -196,7 +220,7 @@ def _process_new_invoice(msg, api_base_url: str) -> str:
     if resp.status_code >= 400:
         return f"error: create HTTP {resp.status_code}: {resp.text[:120]}"
     txn_id = (resp.json() or {}).get("transaction_id")
-    return f"new-invoice: created {txn_id} for {vendor_user} status=created"
+    return f"started {process_key} txn {txn_id} from {sender or 'unknown'} status=created"
 
 
 _REQUIRED_FIELDS = ["poNumber", "costCenter", "taxId"]
@@ -259,7 +283,7 @@ def _process_tagged_reply(txn_id: str, msg, message_id: str, api_base_url: str) 
         return f"error: {exc}"
 
 
-def process_message(raw_bytes: bytes, api_base_url: str) -> str:
+def process_message(raw_bytes: bytes, api_base_url: str, mailbox_name: str = "") -> str:
     # Turn ONE raw RFC822 message into (at most) one API call. Returns a short
     # status string; NEVER raises (a bad message must not kill the poll loop).
     msg = email.message_from_bytes(raw_bytes)
@@ -268,14 +292,14 @@ def process_message(raw_bytes: bytes, api_base_url: str) -> str:
 
     txn_id = extract_txn_id(decode_subject(subject))
     if txn_id is not None:
-        # Tagged reply: approval decision OR request_info resubmit (Phase 4).
+        # Tagged reply: a decision / resubmit on an existing transaction.
         return _process_tagged_reply(txn_id, msg, message_id, api_base_url)
 
-    # No tag => a fresh invoice submitted by email (Phase 3).
-    return _process_new_invoice(msg, api_base_url)
+    # No reply tag => generic intake: start a NEW transaction for the resolved process.
+    return _process_new_transaction(msg, api_base_url, mailbox_name)
 
 
-def poll_once(client, api_base_url: str) -> list[str]:
+def poll_once(client, api_base_url: str, mailbox_name: str = "") -> list[str]:
     # One polling pass: process every UNSEEN message, marking it \Seen ONLY when
     # it was definitively handled:
     #   * result contains "status=" -> the POST reached /v1/events and got a
@@ -293,7 +317,7 @@ def poll_once(client, api_base_url: str) -> list[str]:
     for uid in uids:
         resp = client.fetch([uid], ["RFC822"])
         raw = resp[uid][b"RFC822"]
-        result = process_message(raw, api_base_url)
+        result = process_message(raw, api_base_url, mailbox_name)
         results.append(f"uid {uid}: {result}")
         if "status=" in result or "skipped" in result:
             client.add_flags([uid], [b"\\Seen"])
@@ -341,7 +365,7 @@ def main():
             total = 0
             for box, client in clients:
                 try:
-                    results = poll_once(client, api_base_url)
+                    results = poll_once(client, api_base_url, box["name"])
                 except Exception as exc:
                     print(f"[{ts}] {box['name']}: poll error: {exc}")
                     continue
