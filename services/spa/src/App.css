@@ -1424,3 +1424,56 @@ td.mono {
     flex-direction: column;
   }
 }
+
+/* ---- Admin page + shared panels (clean-up pass) ------------------------- */
+.admin-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
+@media (max-width: 860px) { .admin-grid { grid-template-columns: 1fr; } }
+
+.panel {
+  background: var(--panel, #ffffff);
+  border: 1px solid var(--line, #e2e8f0);
+  border-radius: 14px;
+  padding: 20px 22px;
+  margin-bottom: 20px;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+.panel h3 { margin: 0 0 14px; font-size: 1rem; color: var(--ink, #1e293b); }
+
+.chip-picker { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.chip-choice {
+  display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; font-size: 0.85rem;
+  border: 1px solid var(--line, #cbd5e1); border-radius: 999px; cursor: pointer;
+  color: var(--muted, #64748b); background: var(--panel, #fff);
+}
+.chip-choice.chip-on { color: var(--primary, #4f6ef7); border-color: var(--primary, #4f6ef7); background: rgba(79,110,247,0.08); font-weight: 600; }
+.chip-choice input { margin: 0; }
+
+.role-tag {
+  display: inline-flex; align-items: center; gap: 6px; padding: 5px 6px 5px 12px;
+  font-size: 0.85rem; font-weight: 600; color: var(--ink, #1e293b);
+  background: rgba(79,110,247,0.08); border: 1px solid rgba(79,110,247,0.25); border-radius: 999px;
+}
+.tag-x {
+  display: grid; place-items: center; width: 18px; height: 18px; font-size: 14px; line-height: 1;
+  color: #64748b; background: transparent; border: 0; border-radius: 50%; cursor: pointer;
+}
+.tag-x:hover { color: #ef4444; background: rgba(239,68,68,0.12); }
+
+.inline-form { display: flex; gap: 10px; align-items: center; }
+.inline-form input { flex: 1; }
+.stack-form { display: flex; flex-direction: column; gap: 12px; }
+.stack-form .field { display: flex; flex-direction: column; gap: 5px; }
+.field > span { font-size: 0.8rem; color: var(--muted, #64748b); font-weight: 600; }
+
+.panel input, .stack-form input, .inline-form input, .admin-table input {
+  padding: 8px 11px; border: 1px solid var(--line, #cbd5e1); border-radius: 8px; font: inherit;
+  background: var(--panel, #fff); color: var(--ink, #1e293b);
+}
+.panel input:focus, .admin-table input:focus { outline: 2px solid rgba(79,110,247,0.35); border-color: var(--primary, #4f6ef7); }
+
+.admin-table { width: 100%; border-collapse: collapse; }
+.admin-table th, .admin-table td { text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--line, #eef2f7); vertical-align: top; font-size: 0.9rem; }
+.admin-table th { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted, #64748b); }
+.admin-table tr.editing-row { background: rgba(79,110,247,0.05); }
+.row-actions { display: flex; gap: 8px; }
+.pw-input { display: block; margin-top: 8px; width: 100%; }

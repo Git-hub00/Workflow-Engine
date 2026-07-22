@@ -93,7 +93,7 @@ def main() -> int:
     # demo, and for business users an admin creates later). It REQUIRES
     # loginWithEmailAllowed=false, so users log in by username.
     realm_flags = {"sslRequired": SSL_REQUIRED, "loginWithEmailAllowed": False,
-                   "duplicateEmailsAllowed": True}
+                   "duplicateEmailsAllowed": True, "editUsernameAllowed": True}
     realm_response = s.get(f"{base}/{REALM}", timeout=15)
     if realm_response.status_code == 404:
         s.post(f"{base}", json={"realm": REALM, "enabled": True, **realm_flags}, timeout=15).raise_for_status()

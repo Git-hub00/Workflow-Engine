@@ -1298,8 +1298,98 @@ async def admin_create_role(body: RoleIn, user: dict = Depends(require_role("ops
 async def admin_list_users(user: dict = Depends(require_role("ops_admin"))):
     kc, realm, h = _kc_admin()
     users = requests.get(f"{kc}/admin/realms/{realm}/users", headers=h, params={"max": 500}, timeout=10).json()
-    return [{"username": u.get("username"), "email": u.get("email")}
-            for u in (users if isinstance(users, list) else [])]
+    out = []
+    for u in (users if isinstance(users, list) else []):
+        roles = []
+        try:
+            rm = requests.get(f"{kc}/admin/realms/{realm}/users/{u.get('id')}/role-mappings/realm",
+                              headers=h, timeout=10).json()
+            roles = [r["name"] for r in rm if isinstance(r, dict) and r.get("name")]
+        except Exception:
+            pass
+        out.append({"username": u.get("username"), "email": u.get("email"), "roles": roles})
+    return out
+
+
+CORE_ROLES = {"ops_admin", "process_author"}
+
+
+def _kc_user_id(kc, realm, h, username):
+    found = requests.get(f"{kc}/admin/realms/{realm}/users", headers=h,
+                         params={"username": username, "exact": "true"}, timeout=10).json()
+    return found[0]["id"] if found else None
+
+
+@app.delete("/v1/admin/roles/{name}")
+async def admin_delete_role(name: str, user: dict = Depends(require_role("ops_admin"))):
+    if name in CORE_ROLES:
+        raise HTTPException(status_code=400, detail=f"cannot delete core role '{name}'")
+    kc, realm, h = _kc_admin()
+    r = requests.delete(f"{kc}/admin/realms/{realm}/roles/{name}", headers=h, timeout=10)
+    if r.status_code not in (204, 404):
+        raise HTTPException(status_code=502, detail=f"delete role failed ({r.status_code})")
+    return {"name": name, "status": "deleted"}
+
+
+@app.delete("/v1/admin/users/{username}")
+async def admin_delete_user(username: str, user: dict = Depends(require_role("ops_admin"))):
+    if username == "admin1":
+        raise HTTPException(status_code=400, detail="cannot delete the bootstrap admin")
+    kc, realm, h = _kc_admin()
+    uid = _kc_user_id(kc, realm, h, username)
+    if not uid:
+        raise HTTPException(status_code=404, detail=f"user '{username}' not found")
+    r = requests.delete(f"{kc}/admin/realms/{realm}/users/{uid}", headers=h, timeout=10)
+    if r.status_code not in (204, 404):
+        raise HTTPException(status_code=502, detail=f"delete user failed ({r.status_code})")
+    return {"username": username, "status": "deleted"}
+
+
+class UserUpdate(BaseModel):
+    email: str | None = None
+    password: str | None = None
+    roles: list[str] | None = None
+    new_username: str | None = None
+
+
+@app.put("/v1/admin/users/{username}")
+async def admin_update_user(username: str, body: UserUpdate, user: dict = Depends(require_role("ops_admin"))):
+    kc, realm, h = _kc_admin()
+    uid = _kc_user_id(kc, realm, h, username)
+    if not uid:
+        raise HTTPException(status_code=404, detail=f"user '{username}' not found")
+    rep = requests.get(f"{kc}/admin/realms/{realm}/users/{uid}", headers=h, timeout=10).json()
+    changed = False
+    if body.email is not None:
+        rep["email"] = body.email
+        rep["emailVerified"] = True
+        changed = True
+    if body.new_username:
+        rep["username"] = body.new_username
+        changed = True
+    if changed:
+        requests.put(f"{kc}/admin/realms/{realm}/users/{uid}", headers=h, json=rep, timeout=10)
+    if body.password:
+        requests.put(f"{kc}/admin/realms/{realm}/users/{uid}/reset-password", headers=h,
+                     json={"type": "password", "value": body.password, "temporary": False}, timeout=10)
+    if body.roles is not None:
+        current = requests.get(f"{kc}/admin/realms/{realm}/users/{uid}/role-mappings/realm", headers=h, timeout=10).json()
+        current = [r for r in current if isinstance(r, dict) and r.get("name")]
+        want = set(body.roles)
+        to_remove = [r for r in current if r["name"] not in want]
+        if to_remove:
+            requests.delete(f"{kc}/admin/realms/{realm}/users/{uid}/role-mappings/realm",
+                            headers=h, json=to_remove, timeout=10)
+        have = {r["name"] for r in current}
+        to_add = []
+        for role in want - have:
+            rr = requests.get(f"{kc}/admin/realms/{realm}/roles/{role}", headers=h, timeout=10)
+            if rr.status_code == 200:
+                to_add.append({"id": rr.json()["id"], "name": role})
+        if to_add:
+            requests.post(f"{kc}/admin/realms/{realm}/users/{uid}/role-mappings/realm",
+                          headers=h, json=to_add, timeout=10)
+    return {"username": body.new_username or username, "status": "updated"}
 
 
 class UserIn(BaseModel):

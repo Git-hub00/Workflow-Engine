@@ -39,6 +39,7 @@ async function request(path, { method = 'GET', body } = {}) {
 export const get = (path) => request(path)
 export const post = (path, body) => request(path, { method: 'POST', body })
 export const put = (path, body) => request(path, { method: 'PUT', body })
+export const del = (path) => request(path, { method: 'DELETE' })
 
 // Multipart upload: let the browser set the multipart boundary (no Content-Type).
 export async function upload(path, formData) {
