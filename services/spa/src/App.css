@@ -1477,3 +1477,26 @@ td.mono {
 .admin-table tr.editing-row { background: rgba(79,110,247,0.05); }
 .row-actions { display: flex; gap: 8px; }
 .pw-input { display: block; margin-top: 8px; width: 100%; }
+
+/* ---- Process Builder: two-column + graph controls ---------------------- */
+.builder-layout { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 22px; align-items: start; }
+@media (max-width: 1100px) { .builder-layout { grid-template-columns: 1fr; } }
+.builder-config { min-width: 0; }
+.preview-sticky { position: sticky; top: 16px; }
+.preview-sticky h3 { margin: 0 0 10px; font-size: 1rem; color: var(--ink, #1e293b); }
+
+.step-card { border: 1px solid var(--line, #e2e8f0); border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; background: rgba(148,163,184,0.06); }
+.end-align { justify-content: flex-end; align-items: flex-end; }
+.toggle-field { flex-direction: row !important; align-items: center; gap: 8px; }
+
+.field-error { display: block; margin-top: 4px; color: #dc2626; font-size: 0.75rem; font-weight: 600; }
+.issue-list { margin: 12px 0 0; padding-left: 18px; color: #dc2626; font-size: 0.82rem; }
+.issue-line { font-size: 0.82rem; margin-top: 3px; }
+
+.flow-zoom { position: absolute; top: 10px; right: 10px; z-index: 2; display: flex; gap: 6px; }
+.flow-zoom button {
+  min-width: 30px; height: 30px; display: grid; place-items: center; font-size: 15px; padding: 0 8px;
+  background: #ffffff; border: 1px solid var(--line, #cbd5e1); border-radius: 8px; cursor: pointer; color: #334155;
+}
+.flow-zoom button:hover { background: #f1f5f9; }
+.flow-canvas { border: 1px solid var(--line, #e2e8f0); border-radius: 12px; background: #fbfcfe; }

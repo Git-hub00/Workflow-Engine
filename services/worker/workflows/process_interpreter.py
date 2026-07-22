@@ -251,9 +251,17 @@ class ProcessInterpreterWorkflow:
         await workflow.execute_activity(
             notify, args=[txn_id, "email", message, recipient, self._mailbox], start_to_close_timeout=_T_SHORT)
 
-        sla_hours = (node.get("timeout") or {}).get("slaHours") or cfg.get("slaHours") or 48
+        timeout_cfg = node.get("timeout") or {}
+        sla_hours = timeout_cfg.get("slaHours") or cfg.get("slaHours") or 48
+        on_timeout = timeout_cfg.get("on_timeout", "remind")
         if not await workflow.wait_condition(lambda: self._signal is not None,
                                              timeout=timedelta(hours=sla_hours)):
+            # SLA breached. Auto-decide if the author configured it; otherwise
+            # send a reminder/escalation and keep waiting for a human.
+            if on_timeout == "auto_approve":
+                return {"decision": "approve", "auto": True}
+            if on_timeout == "auto_reject":
+                return {"decision": "reject", "auto": True}
             await workflow.execute_activity(
                 notify, args=[txn_id, "email", "Reminder / escalation", recipient, self._mailbox],
                 start_to_close_timeout=_T_SHORT)

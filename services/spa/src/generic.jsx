@@ -3,7 +3,7 @@
 // Generic, PDD-driven UI building blocks (P5, slice 1). These render from a
 // process definition instead of hardcoding invoice, so ANY published process can
 // be launched from the catalog. Reuses the existing App.css classes for styling.
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { get, post, upload } from './api'
 
 // data_schema is {fieldName: "string"|"number"} in the PDD. Turn it into the
@@ -119,7 +119,7 @@ function computeLayout(pdd) {
   for (const n of nodes) if (level[n.id] === undefined) level[n.id] = maxLevel + 1  // unreachable -> last column
   const cols = {}
   for (const n of nodes) (cols[level[n.id]] = cols[level[n.id]] || []).push(n)
-  const COLW = 220, ROWH = 92, BW = 168, BH = 56, MX = 24, MY = 34
+  const COLW = 270, ROWH = 120, BW = 186, BH = 64, MX = 34, MY = 40
   const pos = {}
   let maxRows = 1
   for (const lv of Object.keys(cols)) maxRows = Math.max(maxRows, cols[lv].length)
@@ -137,67 +137,88 @@ function computeLayout(pdd) {
 
 // Pure diagram from a PDD object (used by the Builder's live preview). Renders a
 // hint until there are nodes to lay out.
-export function FlowDiagram({ pdd }) {
+export function FlowDiagram({ pdd, height = 520 }) {
   const layout = pdd && Array.isArray(pdd.nodes) && pdd.nodes.length ? computeLayout(pdd) : null
-  if (!layout) return <p className="muted">Add a start node and steps to see the diagram.</p>
+  const [view, setView] = useState({ s: 1, x: 0, y: 0 })
+  const drag = useRef(null)
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v))
+  if (!layout) return <p className="muted">Add a start step (and connect steps) to see the diagram.</p>
+
+  const zoom = (f) => setView((v) => ({ ...v, s: clamp(v.s * f, 0.3, 2.5) }))
+  const onWheel = (e) => { e.preventDefault(); zoom(e.deltaY < 0 ? 1.1 : 0.9) }
+  const onDown = (e) => { drag.current = { x: e.clientX, y: e.clientY, ox: view.x, oy: view.y } }
+  const onMove = (e) => {
+    if (!drag.current) return
+    setView((v) => ({ ...v, x: drag.current.ox + (e.clientX - drag.current.x), y: drag.current.oy + (e.clientY - drag.current.y) }))
+  }
+  const onUp = () => { drag.current = null }
+
   return (
-    <div className="flow-canvas" style={{ overflowX: 'auto' }}>
+    <div className="flow-canvas" style={{ height, position: 'relative', overflow: 'hidden' }}>
+      <div className="flow-zoom">
+        <button type="button" onClick={() => zoom(1.2)} title="Zoom in">+</button>
+        <button type="button" onClick={() => zoom(0.8)} title="Zoom out">-</button>
+        <button type="button" onClick={() => setView({ s: 1, x: 0, y: 0 })} title="Reset view">Reset</button>
+      </div>
       <svg
+        width="100%"
+        height="100%"
         viewBox={`0 0 ${layout.width} ${layout.height}`}
-        width={layout.width}
-        height={layout.height}
+        preserveAspectRatio="xMidYMid meet"
         role="img"
         aria-label="Process flow diagram"
+        style={{ cursor: drag.current ? 'grabbing' : 'grab', userSelect: 'none' }}
+        onWheel={onWheel}
+        onMouseDown={onDown}
+        onMouseMove={onMove}
+        onMouseUp={onUp}
+        onMouseLeave={onUp}
       >
         <defs>
           <marker id="bld-arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
             <polygon points="0 0, 9 3.5, 0 7" fill="#94a3b8" />
           </marker>
         </defs>
-        {layout.links.map((link, idx) => {
-          const a = layout.pos[link.from]
-          const b = layout.pos[link.to]
-          if (!a || !b) return null
-          const x1 = a.x + layout.BW
-          const y1 = a.y + layout.BH / 2
-          const x2 = b.x
-          const y2 = b.y + layout.BH / 2
-          const mx = (x1 + x2) / 2
-          const d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`
-          const label = link.label && link.label.length > 16 ? `${link.label.slice(0, 15)}…` : link.label
-          return (
-            <g key={`bld-e-${idx}`}>
-              <path d={d} fill="none" stroke="#94a3b8" strokeWidth="1.3" markerEnd="url(#bld-arrow)" />
-              {label && (
-                <text x={mx} y={(y1 + y2) / 2 - 4} textAnchor="middle" fontSize="10" fill="#64748b">{label}</text>
-              )}
-            </g>
-          )
-        })}
-        {layout.nodes.map((n) => {
-          const p = layout.pos[n.id]
-          if (!p) return null
-          return (
-            <g key={n.id}>
-              <rect
-                x={p.x}
-                y={p.y}
-                width={layout.BW}
-                height={layout.BH}
-                rx="12"
-                fill={NODE_FILL[n.type] || '#f1f5f9'}
-                stroke={NODE_STROKE[n.type] || '#cbd5e1'}
-                strokeWidth="1.5"
-              />
-              <text x={p.x + layout.BW / 2} y={p.y + 24} textAnchor="middle" fontSize="13" fontWeight="600" fill="#1e293b">{n.id}</text>
-              <text x={p.x + layout.BW / 2} y={p.y + 42} textAnchor="middle" fontSize="10" fill="#64748b">{n.type}</text>
-            </g>
-          )
-        })}
+        <g transform={`translate(${view.x} ${view.y}) scale(${view.s})`}>
+          {layout.links.map((link, idx) => {
+            const a = layout.pos[link.from]
+            const b = layout.pos[link.to]
+            if (!a || !b) return null
+            const x1 = a.x + layout.BW
+            const y1 = a.y + layout.BH / 2
+            const x2 = b.x
+            const y2 = b.y + layout.BH / 2
+            const mx = (x1 + x2) / 2
+            const d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`
+            const label = link.label && link.label.length > 18 ? `${link.label.slice(0, 17)}...` : link.label
+            return (
+              <g key={`bld-e-${idx}`}>
+                <path d={d} fill="none" stroke="#94a3b8" strokeWidth="1.4" markerEnd="url(#bld-arrow)" />
+                {label && (
+                  <text x={mx} y={(y1 + y2) / 2 - 5} textAnchor="middle" fontSize="10" fill="#475569"
+                        stroke="#ffffff" strokeWidth="3" paintOrder="stroke">{label}</text>
+                )}
+              </g>
+            )
+          })}
+          {layout.nodes.map((n) => {
+            const p = layout.pos[n.id]
+            if (!p) return null
+            return (
+              <g key={n.id}>
+                <rect x={p.x} y={p.y} width={layout.BW} height={layout.BH} rx="12"
+                      fill={NODE_FILL[n.type] || '#f1f5f9'} stroke={NODE_STROKE[n.type] || '#cbd5e1'} strokeWidth="1.5" />
+                <text x={p.x + layout.BW / 2} y={p.y + 26} textAnchor="middle" fontSize="13" fontWeight="600" fill="#1e293b">{n.id}</text>
+                <text x={p.x + layout.BW / 2} y={p.y + 44} textAnchor="middle" fontSize="10" fill="#64748b">{n.type}</text>
+              </g>
+            )
+          })}
+        </g>
       </svg>
     </div>
   )
 }
+
 
 export function ProcessFlowDynamic() {
   const [processes, setProcesses] = useState([])
