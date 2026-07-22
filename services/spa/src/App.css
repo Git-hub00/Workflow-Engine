@@ -1500,3 +1500,91 @@ td.mono {
 }
 .flow-zoom button:hover { background: #f1f5f9; }
 .flow-canvas { border: 1px solid var(--line, #e2e8f0); border-radius: 12px; background: #fbfcfe; }
+
+/* ---- Guided Process Builder ------------------------------------------- */
+.builder-config > .panel, .builder-config > .adv { margin-bottom: 18px; }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; align-items: end; }
+@media (max-width: 720px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+
+.config-field select, .config-field textarea {
+  width: 100%; min-height: 42px; padding: 8px 11px; color: #253149;
+  background: #fff; border: 1px solid #cbd3df; border-radius: 8px;
+}
+.config-field select:hover { border-color: #aeb9c9; }
+.toggle-field { display: flex !important; flex-direction: row; align-items: center; gap: 8px; }
+.toggle-field input { width: auto; min-height: 0; }
+
+.panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+.panel-head h3 { margin: 0; }
+.empty-hint { color: var(--muted, #64748b); font-size: 0.9rem; padding: 16px; border: 1px dashed #cbd5e1; border-radius: 10px; background: #fbfcfe; }
+
+/* step cards */
+.step-card { position: relative; }
+.step-card.kind-appr { border-left: 4px solid #4f6ef7; }
+.step-card.kind-dec  { border-left: 4px solid #7c3aed; }
+.step-card.kind-coll { border-left: 4px solid #0891b2; }
+.step-card.kind-auto { border-left: 4px solid #0d9488; }
+.step-card.kind-wait { border-left: 4px solid #d97706; }
+.step-card.kind-fin  { border-left: 4px solid #475569; }
+
+.step-head { display: flex; align-items: center; gap: 10px; }
+.step-badge { font-size: 0.68rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.03em; padding: 4px 9px; border-radius: 999px; color: #fff; white-space: nowrap; }
+.step-badge.appr { background: #4f6ef7; }
+.step-badge.dec  { background: #7c3aed; }
+.step-badge.coll { background: #0891b2; }
+.step-badge.auto { background: #0d9488; }
+.step-badge.wait { background: #d97706; }
+.step-badge.fin  { background: #475569; }
+.start-pill { font-size: 0.66rem; font-weight: 700; color: #0369a1; background: #e0f2fe; padding: 3px 8px; border-radius: 999px; }
+.step-name { flex: 1; min-width: 60px; font-weight: 700; font-size: 0.95rem; padding: 7px 10px; border: 1px solid #cbd3df; border-radius: 8px; background: #fff; color: #253149; }
+.step-tools { display: flex; gap: 5px; margin-left: auto; }
+.step-hint { color: var(--muted, #64748b); font-size: 0.82rem; margin: 8px 0 12px; }
+.editor { display: flex; flex-direction: column; gap: 12px; }
+
+.icon-btn { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid #cbd5e1; border-radius: 8px; background: #fff; cursor: pointer; color: #475569; font-size: 14px; line-height: 1; }
+.icon-btn:hover:not(:disabled) { background: #f1f5f9; }
+.icon-btn:disabled { opacity: 0.35; cursor: default; }
+.icon-btn.danger:hover { background: #fef2f2; color: #dc2626; border-color: #fca5a5; }
+
+/* rules */
+.mini-label { font-size: 0.75rem; font-weight: 800; color: #34425a; }
+.rule-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.rule-lead { font-size: 0.8rem; font-weight: 700; color: #475569; }
+.rule-row select, .rule-row input { min-height: 40px; padding: 7px 10px; border: 1px solid #cbd3df; border-radius: 8px; background: #fff; color: #253149; }
+.rule-val { width: 160px; }
+.rule-row.otherwise { margin-top: 2px; }
+
+/* chips + pick */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.chip { display: inline-flex; align-items: center; gap: 6px; background: #eef2ff; color: #3730a3; border-radius: 999px; padding: 4px 6px 4px 11px; font-size: 0.82rem; }
+.chip button { border: none; background: transparent; cursor: pointer; color: #6366f1; font-size: 15px; line-height: 1; padding: 0; }
+.chips input { min-height: 36px; padding: 6px 10px; border: 1px solid #cbd3df; border-radius: 8px; min-width: 120px; background: #fff; }
+.chips-pick { display: flex; flex-wrap: wrap; gap: 8px; }
+.pick { border: 1px solid #cbd3df; background: #fff; color: #475569; border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 0.85rem; }
+.pick.on { background: var(--primary, #4f6ef7); border-color: var(--primary, #4f6ef7); color: #fff; }
+
+.link-btn { align-self: flex-start; background: transparent; border: none; color: var(--primary, #4f6ef7); font-weight: 700; cursor: pointer; font-size: 0.85rem; padding: 4px 2px; }
+.link-btn:hover { text-decoration: underline; }
+
+/* add-step tray */
+.add-step { margin-top: 8px; border-top: 1px dashed #d7dee8; padding-top: 14px; }
+.add-step-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.add-btn { border: 1px solid #cbd5e1; background: #fff; border-radius: 9px; padding: 8px 12px; font-size: 0.85rem; font-weight: 600; cursor: pointer; color: #334155; }
+.add-btn:hover { border-color: var(--primary, #4f6ef7); color: var(--primary, #4f6ef7); background: #f5f7ff; }
+
+/* advanced rows */
+.cfg-row { display: grid; grid-template-columns: 1fr 130px 34px; gap: 10px; align-items: center; margin-bottom: 10px; }
+.cfg-row.wide { grid-template-columns: 1.2fr 110px 1.6fr 34px; }
+.cfg-row input, .cfg-row select { min-height: 40px; padding: 7px 10px; border: 1px solid #cbd3df; border-radius: 8px; background: #fff; color: #253149; width: 100%; }
+@media (max-width: 720px) { .cfg-row, .cfg-row.wide { grid-template-columns: 1fr; } }
+
+details.adv { border: 1px solid var(--line, #e2e8f0); border-radius: 12px; padding: 0; background: #fff; }
+details.adv summary { cursor: pointer; padding: 14px 16px; font-weight: 700; font-size: 0.95rem; list-style: none; }
+details.adv summary::-webkit-details-marker { display: none; }
+details.adv summary::before { content: '▸ '; color: var(--muted, #64748b); }
+details.adv[open] summary::before { content: '▾ '; }
+details.adv[open] summary { border-bottom: 1px solid var(--line, #eef2f7); }
+details.adv > *:not(summary) { margin-left: 16px; margin-right: 16px; }
+details.adv > *:last-child { margin-bottom: 16px; }
+details.adv[open] > .cfg-row:first-of-type, details.adv[open] > .link-btn { margin-top: 14px; }

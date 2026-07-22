@@ -1162,6 +1162,13 @@ def _check_pdd(pdd: dict) -> tuple[list, list]:
     return errors, warnings
 
 
+# Open, read-only list of realm role names so authors can PICK roles in the
+# Builder. Creating/deleting roles stays admin-only under /v1/admin/roles.
+@app.get("/v1/roles")
+async def list_roles():
+    return sorted(_keycloak_realm_roles() or [])
+
+
 class DefinitionIn(BaseModel):
     pdd: dict
     publish: bool = True
