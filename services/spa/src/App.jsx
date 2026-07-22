@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { get, post, put, upload } from './api'
 import keycloak from './keycloak'
 import { uuid } from './uuid'
-import { StartProcess, GenericTaskForm, ProcessFlowDynamic } from './generic'
+import { GenericTaskForm, ProcessFlowDynamic } from './generic'
 import { ProcessBuilder } from './builder'
 import { AdminPanel } from './admin'
 import './App.css'
@@ -905,13 +905,16 @@ function App() {
   // tasks and start a request; authors get the Builder; admins get Monitor + Admin.
   const isAuthor = roles.includes('process_author')
   const isOps = roles.includes('ops_admin')
+  // "Business" = holds a role that isn't a core app role. Those users do tasks
+  // and watch the monitor for their workflow. Admin administers; author builds.
+  const isBusiness = roles.some((r) => r !== 'process_author' && r !== 'ops_admin')
   const navTabs = []
-  navTabs.push({ id: 'tasks', label: 'Task Inbox' })
-  navTabs.push({ id: 'start', label: 'Start Process' })
-  navTabs.push({ id: 'flow', label: 'Process Flow' })
+  if (isBusiness) navTabs.push({ id: 'tasks', label: 'Task Inbox' })
   if (isAuthor) navTabs.push({ id: 'builder', label: 'Builder' })
-  if (isOps) navTabs.push({ id: 'monitor', label: 'Monitor' })
+  if (isAuthor) navTabs.push({ id: 'flow', label: 'Process Flow' })
+  if (isBusiness || isOps) navTabs.push({ id: 'monitor', label: 'Monitor' })
   if (isOps) navTabs.push({ id: 'admin', label: 'Admin' })
+  if (!navTabs.length) navTabs.push({ id: 'flow', label: 'Process Flow' })
   const [activeTab, setActiveTab] = useState(navTabs[0].id)
 
   return (
@@ -957,10 +960,9 @@ function App() {
 
       <main>
         {activeTab === 'tasks' && <TaskInbox roles={roles} username={username} />}
-        {activeTab === 'start' && <StartProcess />}
         {activeTab === 'flow' && <ProcessFlowDynamic />}
         {activeTab === 'builder' && <ProcessBuilder />}
-        {activeTab === 'monitor' && <Monitor />}
+        {activeTab === 'monitor' && <Monitor roles={roles} />}
         {activeTab === 'admin' && <AdminPanel />}
       </main>
     </div>

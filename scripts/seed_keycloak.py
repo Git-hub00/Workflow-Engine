@@ -39,10 +39,11 @@ ROLES = ["ops_admin", "process_author"]
 
 # Demo users -> (realm roles, optional email). Password is USER_PW for all.
 USERS = {
-    # The engine starts with a SINGLE admin account. All other roles and users are
-    # created by the admin in-app (Admin screen) or in Keycloak — nothing
-    # invoice-specific is seeded.
-    "admin1": (["ops_admin", "process_author"], "realgowtham2005@gmail.com"),
+    # The engine starts with just an ADMIN and an AUTHOR. The admin manages roles
+    # and users; the author builds workflows. Business roles/users are created by
+    # the admin in-app — nothing invoice-specific is seeded.
+    "admin1": (["ops_admin"], "realgowtham2005@gmail.com"),
+    "author1": (["process_author"], "realgowtham2005@gmail.com"),
 }
 
 # Public browser origins the SPA is served from (redirect URIs + web origins).
