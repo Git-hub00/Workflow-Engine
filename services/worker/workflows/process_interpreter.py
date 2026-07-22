@@ -182,8 +182,18 @@ class ProcessInterpreterWorkflow:
         return None
 
     def _merge_corrected(self, data, sig):
-        corrected = sig.get("data") if isinstance(sig, dict) else None
-        return {**data, **corrected} if corrected else data
+        # A request-info resubmit may carry corrected fields either under "data"
+        # (legacy vendor-portal shape) OR as top-level form fields (generic Task
+        # Inbox). Merge whichever is present so the corrected request re-reviews.
+        if not isinstance(sig, dict):
+            return data
+        corrected = sig.get("data")
+        if corrected:
+            return {**data, **corrected}
+        control = {"decision", "reason", "kind", "idempotency_key",
+                   "task_token", "transaction_id", "participant", "terminal"}
+        extra = {k: v for k, v in sig.items() if k not in control}
+        return {**data, **extra} if extra else data
 
     # ---- notification helpers (PDD-driven) --------------------------------
 

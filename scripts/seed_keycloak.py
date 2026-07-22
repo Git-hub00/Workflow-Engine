@@ -33,21 +33,16 @@ USER_PW = os.getenv("SEED_USER_PASSWORD", "12345")
 
 CLIENT_ID = "workflow-spa"
 
-# Roles for the realm. NOTE: ap_clerk is intentionally ABSENT — request_info was
-# reassigned to the "vendor" role.
-ROLES = ["ap_manager", "finance", "ops_admin", "process_author", "vendor"]
+# Core app roles only. Business roles (manager, finance, vendor, …) are created by
+# the admin in-app per the processes they build — not seeded here.
+ROLES = ["ops_admin", "process_author"]
 
 # Demo users -> (realm roles, optional email). Password is USER_PW for all.
 USERS = {
-    # Internal-role emails are DEMO PLACEHOLDERS (the user's own inbox) so that
-    # role-based notifications actually deliver. Change these to real per-user
-    # addresses in the Keycloak admin console (or here) for a true multi-user demo.
-    "manager1": (["ap_manager"], "realgowtham2005@gmail.com"),
-    "finance1": (["finance"], "realgowtham2005@gmail.com"),
-    "finance2": (["finance"], "realgowtham2005@gmail.com"),
-    "author1": (["process_author"], "realgowtham2005@gmail.com"),
-    "vendor_acme": (["vendor"], "og.gowtham.sk@gmail.com"),
-    "vendor_globex": (["vendor"], "zencoderku001@gmail.com"),
+    # The engine starts with a SINGLE admin account. All other roles and users are
+    # created by the admin in-app (Admin screen) or in Keycloak — nothing
+    # invoice-specific is seeded.
+    "admin1": (["ops_admin", "process_author"], "realgowtham2005@gmail.com"),
 }
 
 # Public browser origins the SPA is served from (redirect URIs + web origins).

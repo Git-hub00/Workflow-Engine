@@ -193,12 +193,13 @@ async def ai_review(txn_id: str, data: dict, cfg: dict, node: dict | None = None
     decisions_dir = Path(__file__).resolve().parent.parent / "decisions"
     if str(decisions_dir) not in sys.path:
         sys.path.insert(0, str(decisions_dir))
+    from decision_engine import decide
     if node and node.get("routes"):
-        from decision_engine import decide
         result = decide(node, data, cfg)
     else:
-        from invoice_review import review_invoice
-        result = review_invoice(data, cfg)
+        # A well-formed llm_decision node always carries routes; without them
+        # there is nothing to choose (the interpreter surfaces this as an error).
+        result = {"route": None, "missing": [], "anomalies": [], "rationale": "no routes on decision node"}
     # The audit event is this activity's ONLY database write (there is no
     # separate business row), so calling append_event WITHOUT conn — letting it
     # open its own transaction — is already atomic for ai_review.

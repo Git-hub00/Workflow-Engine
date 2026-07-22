@@ -1250,6 +1250,91 @@ async def get_definition(process_key: str):
 
 
 # ===========================================================================
+# Admin identity (Ops/Admin, Section 5.8): manage Keycloak roles + users in-app,
+# gated to 'ops_admin'. Per the spec, process authors REFERENCE roles while an
+# admin MANAGES them (separation of duties). Uses the Keycloak Admin REST API.
+# ===========================================================================
+
+
+def _kc_admin():
+    kc = os.getenv("KEYCLOAK_URL", "http://localhost:8081").rstrip("/")
+    realm = os.getenv("KEYCLOAK_REALM", "workflow")
+    try:
+        token = requests.post(
+            f"{kc}/realms/master/protocol/openid-connect/token",
+            data={"client_id": "admin-cli", "grant_type": "password",
+                  "username": os.getenv("KEYCLOAK_ADMIN", "admin"),
+                  "password": os.getenv("KEYCLOAK_ADMIN_PASSWORD", "admin")},
+            timeout=10,
+        ).json().get("access_token")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"keycloak unreachable: {exc}")
+    if not token:
+        raise HTTPException(status_code=502, detail="could not obtain Keycloak admin token")
+    return kc, realm, {"Authorization": f"Bearer {token}"}
+
+
+@app.get("/v1/admin/roles")
+async def admin_list_roles(user: dict = Depends(require_role("ops_admin"))):
+    kc, realm, h = _kc_admin()
+    roles = requests.get(f"{kc}/admin/realms/{realm}/roles", headers=h, timeout=10).json()
+    return sorted(r["name"] for r in roles if isinstance(r, dict) and r.get("name"))
+
+
+class RoleIn(BaseModel):
+    name: str
+
+
+@app.post("/v1/admin/roles")
+async def admin_create_role(body: RoleIn, user: dict = Depends(require_role("ops_admin"))):
+    kc, realm, h = _kc_admin()
+    r = requests.post(f"{kc}/admin/realms/{realm}/roles", headers=h, json={"name": body.name}, timeout=10)
+    if r.status_code not in (201, 409):
+        raise HTTPException(status_code=502, detail=f"create role failed ({r.status_code})")
+    return {"name": body.name, "status": "exists" if r.status_code == 409 else "created"}
+
+
+@app.get("/v1/admin/users")
+async def admin_list_users(user: dict = Depends(require_role("ops_admin"))):
+    kc, realm, h = _kc_admin()
+    users = requests.get(f"{kc}/admin/realms/{realm}/users", headers=h, params={"max": 500}, timeout=10).json()
+    return [{"username": u.get("username"), "email": u.get("email")}
+            for u in (users if isinstance(users, list) else [])]
+
+
+class UserIn(BaseModel):
+    username: str
+    email: str | None = None
+    password: str = "12345"
+    roles: list[str] = []
+
+
+@app.post("/v1/admin/users")
+async def admin_create_user(body: UserIn, user: dict = Depends(require_role("ops_admin"))):
+    kc, realm, h = _kc_admin()
+    payload = {"username": body.username, "enabled": True, "firstName": body.username, "lastName": "User"}
+    if body.email:
+        payload["email"] = body.email
+        payload["emailVerified"] = True
+    requests.post(f"{kc}/admin/realms/{realm}/users", headers=h, json=payload, timeout=10)  # 409 if exists: fine
+    found = requests.get(f"{kc}/admin/realms/{realm}/users", headers=h,
+                         params={"username": body.username, "exact": "true"}, timeout=10).json()
+    if not found:
+        raise HTTPException(status_code=502, detail="user create/lookup failed")
+    uid = found[0]["id"]
+    requests.put(f"{kc}/admin/realms/{realm}/users/{uid}/reset-password", headers=h,
+                 json={"type": "password", "value": body.password, "temporary": False}, timeout=10)
+    assign = []
+    for role in body.roles:
+        rr = requests.get(f"{kc}/admin/realms/{realm}/roles/{role}", headers=h, timeout=10)
+        if rr.status_code == 200:
+            assign.append({"id": rr.json()["id"], "name": role})
+    if assign:
+        requests.post(f"{kc}/admin/realms/{realm}/users/{uid}/role-mappings/realm", headers=h, json=assign, timeout=10)
+    return {"username": body.username, "roles_assigned": [a["name"] for a in assign]}
+
+
+# ===========================================================================
 # Read-only views (Section 11 prep): feed a monitor/dashboard UI — list recent
 # runs and replay a single run's audit timeline. Left open (no auth) like the
 # other GETs.
