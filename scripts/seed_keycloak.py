@@ -89,22 +89,20 @@ def main() -> int:
         print(f"realm: 'master' sslRequired already {SSL_REQUIRED!r}")
 
     # --- realm (create if missing) ---
+    # duplicateEmailsAllowed lets multiple accounts share one inbox (handy for the
+    # demo, and for business users an admin creates later). It REQUIRES
+    # loginWithEmailAllowed=false, so users log in by username.
+    realm_flags = {"sslRequired": SSL_REQUIRED, "loginWithEmailAllowed": False,
+                   "duplicateEmailsAllowed": True}
     realm_response = s.get(f"{base}/{REALM}", timeout=15)
     if realm_response.status_code == 404:
-        s.post(
-            f"{base}",
-            json={"realm": REALM, "enabled": True, "sslRequired": SSL_REQUIRED},
-            timeout=15,
-        ).raise_for_status()
+        s.post(f"{base}", json={"realm": REALM, "enabled": True, **realm_flags}, timeout=15).raise_for_status()
         print(f"realm: created {REALM!r}")
     else:
         realm_response.raise_for_status()
-        realm_repr = realm_response.json()
-        if realm_repr.get("sslRequired") != SSL_REQUIRED:
-            realm_repr["sslRequired"] = SSL_REQUIRED
-            s.put(f"{base}/{REALM}", json=realm_repr, timeout=15).raise_for_status()
-            print(f"realm: updated {REALM!r} sslRequired={SSL_REQUIRED!r}")
-        print(f"realm: {REALM!r} already exists")
+        realm_repr = {**realm_response.json(), **realm_flags}
+        s.put(f"{base}/{REALM}", json=realm_repr, timeout=15).raise_for_status()
+        print(f"realm: updated {REALM!r} (ssl + duplicate-emails)")
 
     realm_base = f"{base}/{REALM}"
 
