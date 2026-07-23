@@ -190,6 +190,23 @@ def _validate_author_finance_config(config: dict) -> tuple[int, int, bool]:
     return required, capacity, reject_short_circuits
 
 
+def _validate_finance_completion(comp: dict) -> None:
+    """Validate a quorum NODE's completion (n / of / rejectShortCircuits). The
+    guided Builder stores quorum on the node, and both engines read it from there,
+    so this is the correct place to check — NOT top-level config."""
+    n = comp.get("n")
+    of = comp.get("of")
+    rsc = comp.get("rejectShortCircuits")
+    ok_ints = (isinstance(n, int) and not isinstance(n, bool)
+               and isinstance(of, int) and not isinstance(of, bool) and 1 <= n <= of)
+    if not ok_ints:
+        raise HTTPException(status_code=422,
+                            detail="invalid quorum: expected integers satisfying 1 <= n <= of")
+    if not isinstance(rsc, bool):
+        raise HTTPException(status_code=422,
+                            detail="invalid quorum: rejectShortCircuits must be true/false")
+
+
 def _finance_policy_values(policy: dict) -> tuple[int, int, bool]:
     """Read a Finance task's immutable policy, including the legacy n/of shape."""
     if not isinstance(policy, dict):
@@ -307,8 +324,14 @@ async def create_transaction(body: TransactionIn, user: dict | None = Depends(_o
     cfg = {**pdd.get("config", {}), "roles": pdd.get("roles", {})}
     # Only enforce the finance-quorum config when this process actually uses a
     # quorum node — a process with no finance approval needs no quorum config.
-    if any((n.get("completion") or {}).get("mode") == "quorum" for n in pdd.get("nodes", [])):
-        _validate_author_finance_config(cfg)
+    # The Builder stores quorum settings on the NODE (completion.n/of/
+    # rejectShortCircuits), which both engines read — so validate the node, not
+    # top-level config. (The old model kept quorum in config; that mismatch made
+    # every quorum process 422 at start, so no transaction was ever created.)
+    for _node in pdd.get("nodes", []):
+        _comp = _node.get("completion") or {}
+        if _comp.get("mode") == "quorum":
+            _validate_finance_completion(_comp)
 
     # 2. Create the transaction row in ONE transaction: new uuid, linked to the
     #    resolved definition_version, status 'running', snapshot = posted data.

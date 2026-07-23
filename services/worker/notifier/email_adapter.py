@@ -138,6 +138,17 @@ def _get_pdd(api_base_url: str, process_key: str):
     return None
 
 
+def _get_active_pdd(api_base_url: str):
+    # The single active (latest published) process, or None.
+    try:
+        r = requests.get(f"{api_base_url}/v1/active-process", timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
 def _process_for_mailbox(api_base_url: str, mailbox_name: str):
     # Find the published process whose PDD is bound to this mailbox (pdd.mailbox).
     try:
@@ -188,8 +199,12 @@ def _process_new_transaction(msg, api_base_url: str, mailbox_name: str) -> str:
     if not process_key:
         process_key, pdd = _process_for_mailbox(api_base_url, mailbox_name)
     if not process_key:
-        return ("skipped (no process to start: add '[start:<process_key>]' to the subject, "
-                f"or bind a process to mailbox {mailbox_name!r}) status=none")
+        # Single-workflow fallback: with one active process, ANY subject starts it
+        # (no [start:...] tag or mailbox binding required).
+        pdd = _get_active_pdd(api_base_url)
+        process_key = (pdd or {}).get("process_key")
+    if not process_key:
+        return "skipped (no active process to start) status=none"
 
     data_schema = (pdd or {}).get("data_schema") or {}
 
