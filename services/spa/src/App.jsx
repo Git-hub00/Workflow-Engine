@@ -911,10 +911,10 @@ function App() {
   const navTabs = []
   if (isBusiness) navTabs.push({ id: 'tasks', label: 'Task Inbox' })
   if (isAuthor) navTabs.push({ id: 'builder', label: 'Builder' })
-  if (isAuthor) navTabs.push({ id: 'flow', label: 'Process Flow' })
+  // Everyone can view the current process flow.
+  navTabs.push({ id: 'flow', label: 'Process Flow' })
   if (isBusiness || isOps) navTabs.push({ id: 'monitor', label: 'Monitor' })
   if (isOps) navTabs.push({ id: 'admin', label: 'Admin' })
-  if (!navTabs.length) navTabs.push({ id: 'flow', label: 'Process Flow' })
   const [activeTab, setActiveTab] = useState(navTabs[0].id)
 
   return (
