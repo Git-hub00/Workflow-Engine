@@ -119,7 +119,7 @@ function computeLayout(pdd) {
   for (const n of nodes) if (level[n.id] === undefined) level[n.id] = maxLevel + 1  // unreachable -> last column
   const cols = {}
   for (const n of nodes) (cols[level[n.id]] = cols[level[n.id]] || []).push(n)
-  const COLW = 270, ROWH = 120, BW = 186, BH = 64, MX = 34, MY = 40
+  const COLW = 270, ROWH = 120, BW = 186, BH = 64, MX = 34, MY = 66
   const pos = {}
   let maxRows = 1
   for (const lv of Object.keys(cols)) maxRows = Math.max(maxRows, cols[lv].length)
@@ -184,18 +184,30 @@ export function FlowDiagram({ pdd, height = 520 }) {
             const a = layout.pos[link.from]
             const b = layout.pos[link.to]
             if (!a || !b) return null
-            const x1 = a.x + layout.BW
-            const y1 = a.y + layout.BH / 2
-            const x2 = b.x
-            const y2 = b.y + layout.BH / 2
-            const mx = (x1 + x2) / 2
-            const d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`
+            const BW = layout.BW, BH = layout.BH
+            const back = b.x <= a.x        // loop-back / same-column edge
+            let d, lx, ly
+            if (back) {
+              // Arc OVER the top so a return edge (e.g. request_info -> review) is
+              // clearly visible instead of hiding straight behind the boxes.
+              const sx = a.x + BW / 2, sy = a.y
+              const ex = b.x + BW / 2, ey = b.y
+              const arc = Math.min(sy, ey) - 42
+              d = `M ${sx} ${sy} C ${sx} ${arc}, ${ex} ${arc}, ${ex} ${ey}`
+              lx = (sx + ex) / 2; ly = arc - 4
+            } else {
+              const x1 = a.x + BW, y1 = a.y + BH / 2
+              const x2 = b.x, y2 = b.y + BH / 2
+              const mx = (x1 + x2) / 2
+              d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`
+              lx = mx; ly = (y1 + y2) / 2 - 5
+            }
             const label = link.label && link.label.length > 18 ? `${link.label.slice(0, 17)}...` : link.label
             return (
               <g key={`bld-e-${idx}`}>
                 <path d={d} fill="none" stroke="#94a3b8" strokeWidth="1.4" markerEnd="url(#bld-arrow)" />
                 {label && (
-                  <text x={mx} y={(y1 + y2) / 2 - 5} textAnchor="middle" fontSize="10" fill="#475569"
+                  <text x={lx} y={ly} textAnchor="middle" fontSize="10" fill="#475569"
                         stroke="#ffffff" strokeWidth="3" paintOrder="stroke">{label}</text>
                 )}
               </g>

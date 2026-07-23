@@ -152,16 +152,22 @@ def _process_for_mailbox(api_base_url: str, mailbox_name: str):
     return None, None
 
 
+def _norm_key(s: str) -> str:
+    # Normalize a field label for matching: drop spaces/underscores, lowercase.
+    # So "PO Number", "po_number" and "poNumber" all match the schema key poNumber.
+    return re.sub(r"[\s_]+", "", s or "").lower()
+
+
 def _parse_body_fields(body: str, field_names) -> dict:
-    # Parse "field: value" lines, matched case-insensitively to the process's
-    # data_schema field names.
-    wanted = {name.lower(): name for name in (field_names or [])}
+    # Parse "field: value" lines, matched to the process's data_schema field names
+    # ignoring spaces/underscores/case (so "PO Number:" maps to poNumber).
+    wanted = {_norm_key(name): name for name in (field_names or [])}
     out = {}
     for line in (body or "").splitlines():
         if ":" not in line:
             continue
         key, _, value = line.partition(":")
-        canon = wanted.get(key.strip().lower())
+        canon = wanted.get(_norm_key(key))
         if canon and value.strip():
             out[canon] = value.strip()
     return out
@@ -229,13 +235,13 @@ _REQUIRED_FIELDS = ["poNumber", "costCenter", "taxId"]
 def _parse_field_lines(body: str, need):
     # Parse "field: value" lines; keys matched case-insensitively against the
     # requested fields (the task's completion_policy.need, else the required set).
-    wanted = {name.lower(): name for name in (need or _REQUIRED_FIELDS)}
+    wanted = {_norm_key(name): name for name in (need or _REQUIRED_FIELDS)}
     parsed = {}
     for line in body.splitlines():
         if ":" not in line:
             continue
         key, _, value = line.partition(":")
-        canonical = wanted.get(key.strip().lower())
+        canonical = wanted.get(_norm_key(key))
         if canonical and value.strip():
             parsed[canonical] = value.strip()
     return parsed

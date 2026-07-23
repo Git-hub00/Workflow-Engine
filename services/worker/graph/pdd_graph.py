@@ -33,6 +33,7 @@ class ProcState(TypedDict, total=False):
     pdd: dict
     data: dict
     route: str
+    missing: list            # fields the last decision flagged as missing
     decision: dict
     quorum_approved: bool
     outcome: str
@@ -95,7 +96,7 @@ class Handlers:
     def run_human(self, txn_id, node):              # human (sync mode)
         return {}
 
-    def open_human(self, txn_id, node):             # human (durable mode)
+    def open_human(self, txn_id, node, missing=None):   # human (durable mode)
         return None
 
     def wait(self, seconds):                        # timer
@@ -137,6 +138,7 @@ def _make_node_fn(node, cfg, h):
         elif ntype == "llm_decision":
             res = h.decide(node, data, cfg) or {}
             upd["route"] = res.get("route")
+            upd["missing"] = res.get("missing") or []
         elif ntype == "timer":
             h.wait(float((node.get("timeout") or {}).get("seconds", 0)))
         elif ntype == "human_task":                  # synchronous mode (tests)
@@ -153,7 +155,9 @@ def _make_node_fn(node, cfg, h):
 
 def _make_open_fn(node, h):
     def fn(state):
-        h.open_human(state["txn_id"], node)
+        # Pass the missing-field list the last decision computed so the task can
+        # show it and the email reply-parser knows exactly which fields to expect.
+        h.open_human(state["txn_id"], node, state.get("missing"))
         return {}
     return fn
 

@@ -67,7 +67,7 @@ class MockHandlers(Handlers):
     def run_human(self, txn_id, node):          # synchronous mode
         return self._decision_for(node["id"])
 
-    def open_human(self, txn_id, node):         # durable mode side-effect
+    def open_human(self, txn_id, node, missing=None):   # durable mode side-effect
         self.opened.append(node["id"])
 
     def wait(self, seconds):

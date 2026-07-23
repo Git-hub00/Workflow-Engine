@@ -50,12 +50,16 @@ class RealHandlers(Handlers):
         from decision_engine import decide
         return decide(node, data, cfg)
 
-    def open_human(self, txn_id, node):
+    def open_human(self, txn_id, node, missing=None):
         # Create the task row (and, for a quorum, the participant slots). The
         # Temporal orchestrator handles reminders/SLA and the actual wait.
         import invoice_activities as A
         completion = node.get("completion") or {}
         policy = {"kind": node["id"]}
+        # Attach the missing fields (from the decision) so the task shows what to
+        # provide and the email reply-parser knows exactly which fields to expect.
+        if missing:
+            policy["need"] = missing
         if completion.get("mode") == "quorum":
             policy["quorum"] = {"n": completion.get("n"), "of": completion.get("of")}
             policy["rejectShortCircuits"] = completion.get("rejectShortCircuits")
