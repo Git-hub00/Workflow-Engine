@@ -17,6 +17,74 @@ import { FlowDiagram } from './generic'
 let _seq = 0
 const uid = () => `u${++_seq}`
 
+// Reverse of buildPdd: turn a published PDD back into the guided-form state so
+// the single active process is EDITABLE anytime. Generic — any workflow.
+const OP_RE = /^\s*([A-Za-z_]\w*)\s*(<=|>=|<|>|==|!=|not in|in)\s*(.+?)\s*$/
+function _parseRule(when, to) {
+  const w = String(when || '').trim()
+  if (w === 'has_missing' || w === 'anomaly') return { id: uid(), field: w, op: '>=', value: '', to }
+  const m = w.match(OP_RE)
+  if (m) {
+    const val = m[3].trim().replace(/^'(.*)'$/, '$1').replace(/^"(.*)"$/, '$1')
+    return { id: uid(), field: m[1], op: m[2], value: val, to }
+  }
+  return { id: uid(), field: w, op: '>=', value: '', to }
+}
+function pddToState(pdd) {
+  const config = Object.entries(pdd.config || {}).map(([key, v]) => (
+    Array.isArray(v) ? { id: uid(), key, kind: 'list', value: '', items: v }
+      : typeof v === 'number' ? { id: uid(), key, kind: 'number', value: String(v), items: [] }
+        : { id: uid(), key, kind: 'text', value: String(v), items: [] }
+  ))
+  const dataFields = Object.entries(pdd.data_schema || {}).map(([name, type]) => ({ id: uid(), name, type }))
+  const steps = []
+  for (const node of pdd.nodes || []) {
+    if (node.type === 'start') continue
+    const base = { key: uid(), name: node.id }
+    const to = node.timeout || {}
+    if (node.type === 'automated') steps.push({ ...base, kind: 'automatic', action: node.action || '', next: node.next || '' })
+    else if (node.type === 'timer') steps.push({ ...base, kind: 'wait', hours: to.seconds ? String(to.seconds / 3600) : '', next: node.next || '' })
+    else if (node.type === 'end') steps.push({ ...base, kind: 'finish', outcome: node.outcome || '' })
+    else if (node.type === 'llm_decision') {
+      const edges = node.edges || {}
+      const rules = []
+      let otherwiseTo = ''
+      for (const r of node.routes || []) {
+        const tgt = edges[r.edge] || ''
+        if (String(r.when || '').trim() === 'default' || r.edge === 'OTHERWISE') { otherwiseTo = tgt; continue }
+        rules.push(_parseRule(r.when, tgt))
+      }
+      steps.push({ ...base, kind: 'decision', rules: rules.length ? rules : [{ id: uid(), field: '', op: '>=', value: '', to: '' }], otherwiseTo })
+    } else if (node.type === 'human_task') {
+      const role = (node.assignment || {}).role || ''
+      if (Array.isArray(node.edges)) {
+        const quorum = (node.completion || {}).mode === 'quorum'
+        let approveTo = '', rejectTo = ''
+        for (const e of node.edges) {
+          const w = String(e.when || '').trim()
+          if (w === 'quorum_approved' || w === "decision == 'approve'") approveTo = e.to
+          else rejectTo = e.to
+        }
+        steps.push({
+          ...base, kind: 'approval', role, completion: quorum ? 'quorum' : 'single',
+          quorumN: quorum ? String((node.completion || {}).n || '') : '',
+          quorumOf: quorum ? String((node.completion || {}).of || '') : '',
+          rejectShortCircuits: !!(node.completion || {}).rejectShortCircuits,
+          slaHours: to.slaHours ? String(to.slaHours) : '48', onTimeout: to.on_timeout || 'remind',
+          approveTo, rejectTo,
+        })
+      } else {
+        const fields = ((node.form_schema || {}).fields || []).map((f) => f.key)
+        steps.push({ ...base, kind: 'collect', role, fields, slaHours: to.slaHours ? String(to.slaHours) : '', next: node.next || '' })
+      }
+    }
+  }
+  const notifications = (pdd.notifications || []).map((n) => ({
+    id: uid(), on: n.on || '', target: n.to === 'submitter' ? 'submitter' : (n.to_role || ''), template: n.template || '',
+  }))
+  return { processKey: pdd.process_key || '', mailbox: pdd.mailbox || '', config, dataFields, steps, notifications }
+}
+
 const KIND_META = {
   automatic: { label: 'Automatic step', badge: 'auto', hint: 'Runs a built-in action (extract data, post to system of record).' },
   decision: { label: 'Decision', badge: 'dec', hint: 'Sends the request different ways based on rules.' },
@@ -67,7 +135,27 @@ export function ProcessBuilder() {
   const [feedback, setFeedback] = useState(null)
   const [busy, setBusy] = useState(false)
 
+  const [loadedKey, setLoadedKey] = useState(null)
+
   useEffect(() => { get('/v1/roles').then((r) => setRoles(Array.isArray(r) ? r : [])).catch(() => setRoles([])) }, [])
+
+  // One workflow at a time: load the active process so it's editable. The author
+  // edits this and re-publishes (publishing updates the single active process).
+  useEffect(() => {
+    get('/v1/active-process').then((pdd) => {
+      if (pdd && Array.isArray(pdd.nodes) && pdd.nodes.length) {
+        const s = pddToState(pdd)
+        setProcessKey(s.processKey); setMailbox(s.mailbox); setConfig(s.config)
+        setDataFields(s.dataFields); setSteps(s.steps); setNotifications(s.notifications)
+        setLoadedKey(s.processKey)
+      }
+    }).catch(() => {})
+  }, [])
+
+  function newBlank() {
+    setProcessKey(''); setMailbox(''); setConfig([]); setDataFields([]); setSteps([]); setNotifications([])
+    setValidation(null); setFeedback(null); setLoadedKey(null)
+  }
 
   // ---- derived option lists --------------------------------------------
   const stepNames = steps.map((s) => s.name).filter(Boolean)
@@ -287,8 +375,11 @@ export function ProcessBuilder() {
         <div>
           <p className="eyebrow">Design time</p>
           <h2 id="builder-heading">Process Builder</h2>
-          <p>Add steps on the left in plain language — the flow draws itself on the right. Fix any red hints, then Publish.</p>
+          <p>{loadedKey
+            ? `Editing “${loadedKey}”. Change anything and Publish to update the active workflow.`
+            : 'Add steps on the left in plain language — the flow draws itself on the right. Fix any red hints, then Publish.'}</p>
         </div>
+        <button type="button" className="secondary-button" onClick={newBlank}>New blank process</button>
       </div>
 
       <div className="builder-layout">

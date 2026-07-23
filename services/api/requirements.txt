@@ -2,6 +2,7 @@ alembic
 sqlalchemy
 psycopg[binary]
 langgraph
+langgraph-checkpoint-postgres
 langchain-openai
 temporalio
 fastapi

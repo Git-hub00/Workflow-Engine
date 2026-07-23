@@ -337,12 +337,16 @@ async def create_transaction(body: TransactionIn, user: dict | None = Depends(_o
     #    dispatches to the main "invoice-tq" queue the worker polls.
     # Start the GENERIC interpreter with the full PDD (nodes/edges). The interpreter
     # derives cfg/roles from it and walks the graph — invoice is just one PDD.
-    await app.state.temporal.start_workflow(
-        ProcessInterpreterWorkflow.run,
-        args=[txn_id, pdd],
-        id=txn_id,
-        task_queue="invoice-tq",
-    )
+    # Engine switch. Default = the LangGraph orchestrator (started BY NAME so the
+    # API never has to import langgraph). Set ORCHESTRATOR=temporal to fall back
+    # to the old interpreter. Both use the SAME signals, so task completion,
+    # finance votes, and tracking work identically either way.
+    if os.getenv("ORCHESTRATOR", "langgraph").lower() == "temporal":
+        await app.state.temporal.start_workflow(
+            ProcessInterpreterWorkflow.run, args=[txn_id, pdd], id=txn_id, task_queue="invoice-tq")
+    else:
+        await app.state.temporal.start_workflow(
+            "GraphOrchestratorWorkflow", args=[txn_id, pdd], id=txn_id, task_queue="invoice-tq")
 
     # 4. Hand the caller the id they use to track/act on this run.
     return {"transaction_id": txn_id}
@@ -1253,6 +1257,20 @@ async def get_definition(process_key: str):
         ), {"pk": process_key}).scalar_one_or_none()
     if pdd is None:
         raise HTTPException(status_code=404, detail=f"No published definition for '{process_key}'")
+    return pdd
+
+
+# WHY GET /v1/active-process: the "one workflow at a time" model. Returns the
+# single active (latest published) PDD so the Builder can LOAD it for editing —
+# the author edits this one and re-publishes. Returns null if none exists yet.
+@app.get("/v1/active-process")
+async def active_process():
+    with engine.connect() as conn:
+        pdd = conn.execute(text(
+            "SELECT dv.pdd FROM definition_version dv "
+            "WHERE dv.status = 'published' "
+            "ORDER BY dv.version DESC, dv.id DESC LIMIT 1"
+        )).scalar_one_or_none()
     return pdd
 
 

@@ -36,7 +36,8 @@ from temporalio.worker import Worker
 HERE = Path(__file__).resolve().parent
 ACTIVITIES_DIR = HERE / "activities"
 WORKFLOWS_DIR = HERE / "workflows"
-for d in (ACTIVITIES_DIR, WORKFLOWS_DIR):
+GRAPH_DIR = HERE / "graph"
+for d in (ACTIVITIES_DIR, WORKFLOWS_DIR, GRAPH_DIR):
     if str(d) not in sys.path:
         sys.path.insert(0, str(d))
 
@@ -49,7 +50,9 @@ from invoice_activities import (  # noqa: E402  (import after sys.path tweak)
     post_to_erp,
     set_transaction_status,
 )
-from process_interpreter import ProcessInterpreterWorkflow  # noqa: E402  (generic engine)
+from process_interpreter import ProcessInterpreterWorkflow  # noqa: E402  (Temporal engine, fallback)
+from graph_orchestrator import GraphOrchestratorWorkflow  # noqa: E402  (LangGraph engine)
+from graph_activities import graph_advance  # noqa: E402  (sync activity: runs the LangGraph run)
 
 
 async def main():
@@ -61,8 +64,11 @@ async def main():
     worker_main = Worker(
         client,
         task_queue="invoice-tq",
-        workflows=[ProcessInterpreterWorkflow],
-        activities=[append_event, extract_fields, create_human_task, notify, post_to_erp, set_transaction_status],
+        # Both engines are registered; the API starts whichever ORCHESTRATOR selects.
+        # graph_advance is a SYNC activity (runs the LangGraph run in a worker thread).
+        workflows=[ProcessInterpreterWorkflow, GraphOrchestratorWorkflow],
+        activities=[append_event, extract_fields, create_human_task, notify, post_to_erp,
+                    set_transaction_status, graph_advance],
         activity_executor=ThreadPoolExecutor(max_workers=8),
     )
 

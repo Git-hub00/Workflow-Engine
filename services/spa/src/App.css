@@ -1482,7 +1482,11 @@ td.mono {
 .builder-layout { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 22px; align-items: start; }
 @media (max-width: 1100px) { .builder-layout { grid-template-columns: 1fr; } }
 .builder-config { min-width: 0; }
-.preview-sticky { position: sticky; top: 16px; }
+/* The whole graph column is sticky (stays put) while the left config scrolls.
+   Sticky must live on the grid CHILD (its containing block is the tall grid row),
+   not on an inner div whose parent is only content-height. */
+.builder-preview { position: sticky; top: 16px; align-self: start; }
+.preview-sticky { position: static; }
 .preview-sticky h3 { margin: 0 0 10px; font-size: 1rem; color: var(--ink, #1e293b); }
 
 .step-card { border: 1px solid var(--line, #e2e8f0); border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; background: rgba(148,163,184,0.06); }
