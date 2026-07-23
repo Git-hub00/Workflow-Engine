@@ -55,7 +55,7 @@ class GraphOrchestratorWorkflow:
         nodes = {n["id"]: n for n in pdd.get("nodes", []) if "id" in n}
 
         await workflow.execute_activity(
-            append_event, args=[txn_id, "temporal", "WORKFLOW_RUNNING", "LangGraph", "started"],
+            append_event, args=[txn_id, "engine", "WORKFLOW_RUNNING", "LangGraph", "started"],
             start_to_close_timeout=_T_SHORT)
 
         # First hop: run the graph to the first human pause or to the end.

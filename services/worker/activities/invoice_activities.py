@@ -537,7 +537,11 @@ async def notify(txn_id: str, channel: str, message: str, recipient: dict | None
     msg["Subject"] = f"[invoice-{txn_id}] {message}"
     msg["From"] = box["address"]
     msg["To"] = ", ".join(recipients)
-    msg.set_content(f"{message}\n\nReply to this email with your decision (e.g. approve / reject / return).")
+    # Send just the message. (The old hardcoded "reply with approve/reject/return"
+    # line was wrong on final notifications and triggered Gmail's smart-reply
+    # buttons. If a specific step wants a reply hint, put it in that step's
+    # notification template in the PDD.)
+    msg.set_content(message)
 
     try:
         with smtplib.SMTP(box["smtp_host"], box["smtp_port"]) as server:

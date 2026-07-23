@@ -75,6 +75,8 @@ jobs:
             LLM_MAX_CONCURRENCY=100
             DATABASE_URL=postgresql+psycopg://app:app@localhost:5432/workflow_app
             TEMPORAL_ADDRESS=localhost:7233
+            # Orchestrator engine: 'langgraph' (default) or 'temporal' (fallback).
+            ORCHESTRATOR=langgraph
             KEYCLOAK_URL=http://localhost:8081
             KEYCLOAK_REALM=workflow
             KEYCLOAK_ADMIN=admin

@@ -330,8 +330,8 @@ export function ProcessBuilder() {
         if (!s.rejectTo) e.rejectTo = 'Set where rejected goes'
       }
       if (s.kind === 'decision') {
-        const ok = (s.rules || []).some((r) => r.field && r.to)
-        if (!ok && !s.otherwiseTo) e.rules = 'Add a rule → step (or an otherwise target)'
+        if (!s.otherwiseTo) e.otherwise = 'Set an “Otherwise →” target (the fallback when no rule matches)'
+        if (!(s.rules || []).some((r) => r.field && r.to)) e.rules = 'Add at least one rule → step'
       }
       perStep[s.key] = e
     })
@@ -541,6 +541,7 @@ export function ProcessBuilder() {
                         <span className="rule-lead">Otherwise →</span>
                         <StepSelect value={s.otherwiseTo} selfName={s.name} onChange={(v) => patchStep(s.key, { otherwiseTo: v })} />
                       </div>
+                      <Err msg={e.otherwise} />
                       <Err msg={e.rules} />
                     </div>
                   )}

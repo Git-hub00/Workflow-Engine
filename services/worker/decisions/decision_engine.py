@@ -123,8 +123,10 @@ def _assess(state: DecisionState) -> dict:
         if _safe_eval(r.get("when"), namespace):
             route = r.get("edge")
             break
-    if route is None and routes:  # safety: fall back to the last (default) route
-        route = routes[-1].get("edge")
+    # NO silent fallback. Previously this picked the LAST route when nothing
+    # matched — which could wrongly auto-approve. A well-built decision always has
+    # a 'default' (Otherwise) route, which matches here. If none does, route stays
+    # None and the caller fails visibly instead of guessing.
     return {"missing": missing, "anomalies": anomalies,
             "anomaly": len(anomalies) > 0, "has_missing": len(missing) > 0,
             "route": route}
