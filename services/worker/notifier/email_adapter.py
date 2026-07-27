@@ -163,6 +163,44 @@ def _process_for_mailbox(api_base_url: str, mailbox_name: str):
     return None, None
 
 
+_MACHINE_SENDERS = ("mailer-daemon", "postmaster", "no-reply", "noreply",
+                    "do-not-reply", "donotreply", "bounce", "notification-daemon")
+_MACHINE_SUBJECTS = ("delivery status notification", "undelivered mail",
+                     "undeliverable", "mail delivery", "address not found",
+                     "returned mail", "failure notice", "out of office",
+                     "automatic reply", "auto-reply", "autoreply")
+
+
+def is_machine_mail(msg, mailbox_address: str = "") -> str | None:
+    """Return a reason string when this message is a bounce / auto-reply / our own
+    mail, else None. Such mail must NEVER start a process or complete a task —
+    a bounce for a bad recipient was previously read back in as a NEW request."""
+    frm = (_sender_email(msg) or "").lower()
+    local = frm.split("@", 1)[0] if "@" in frm else frm
+    if any(tok in local for tok in _MACHINE_SENDERS) or frm.startswith("mailer-daemon"):
+        return f"machine sender {frm!r}"
+    if mailbox_address and frm == mailbox_address.strip().lower():
+        return "message sent by this mailbox to itself"
+
+    auto = (msg.get("Auto-Submitted") or "").strip().lower()
+    if auto and auto != "no":
+        return f"Auto-Submitted: {auto}"
+    for header in ("X-Autoreply", "X-Autorespond", "X-Failed-Recipients"):
+        if msg.get(header):
+            return f"header {header}"
+    if (msg.get("Precedence") or "").strip().lower() in ("auto_reply", "bulk", "junk"):
+        return "Precedence header"
+
+    ctype = (msg.get("Content-Type") or "").lower()
+    if "multipart/report" in ctype or "delivery-status" in ctype:
+        return "delivery-status report"
+
+    subject = decode_subject(msg.get("Subject", "")).strip().lower()
+    if any(s in subject for s in _MACHINE_SUBJECTS):
+        return f"machine subject {subject[:40]!r}"
+    return None
+
+
 def _norm_key(s: str) -> str:
     # Normalize a field label for matching: drop spaces/underscores, lowercase.
     # So "PO Number", "po_number" and "poNumber" all match the schema key poNumber.
@@ -304,12 +342,18 @@ def _process_tagged_reply(txn_id: str, msg, message_id: str, api_base_url: str) 
         return f"error: {exc}"
 
 
-def process_message(raw_bytes: bytes, api_base_url: str, mailbox_name: str = "") -> str:
+def process_message(raw_bytes: bytes, api_base_url: str, mailbox_name: str = "",
+                    mailbox_address: str = "") -> str:
     # Turn ONE raw RFC822 message into (at most) one API call. Returns a short
     # status string; NEVER raises (a bad message must not kill the poll loop).
     msg = email.message_from_bytes(raw_bytes)
     subject = msg.get("Subject", "")
     message_id = msg.get("Message-ID", "")
+
+    # Bounces, auto-replies and our own outgoing mail are NOT human input.
+    machine = is_machine_mail(msg, mailbox_address)
+    if machine:
+        return f"skipped ({machine}) status=none"
 
     txn_id = extract_txn_id(decode_subject(subject))
     if txn_id is not None:
@@ -320,7 +364,8 @@ def process_message(raw_bytes: bytes, api_base_url: str, mailbox_name: str = "")
     return _process_new_transaction(msg, api_base_url, mailbox_name)
 
 
-def poll_once(client, api_base_url: str, mailbox_name: str = "") -> list[str]:
+def poll_once(client, api_base_url: str, mailbox_name: str = "",
+              mailbox_address: str = "") -> list[str]:
     # One polling pass: process every UNSEEN message, marking it \Seen ONLY when
     # it was definitively handled:
     #   * result contains "status=" -> the POST reached /v1/events and got a
@@ -338,7 +383,7 @@ def poll_once(client, api_base_url: str, mailbox_name: str = "") -> list[str]:
     for uid in uids:
         resp = client.fetch([uid], ["RFC822"])
         raw = resp[uid][b"RFC822"]
-        result = process_message(raw, api_base_url, mailbox_name)
+        result = process_message(raw, api_base_url, mailbox_name, mailbox_address)
         results.append(f"uid {uid}: {result}")
         if "status=" in result or "skipped" in result:
             client.add_flags([uid], [b"\\Seen"])
@@ -386,7 +431,7 @@ def main():
             total = 0
             for box, client in clients:
                 try:
-                    results = poll_once(client, api_base_url, box["name"])
+                    results = poll_once(client, api_base_url, box["name"], box.get("address", ""))
                 except Exception as exc:
                     print(f"[{ts}] {box['name']}: poll error: {exc}")
                     continue

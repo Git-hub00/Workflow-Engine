@@ -21,6 +21,7 @@ from temporalio.exceptions import ApplicationError
 with workflow.unsafe.imports_passed_through():
     from invoice_activities import append_event, notify
     from graph_activities import graph_advance
+    from pdd_norm import normalize_pdd, is_quorum
 
 _T_SHORT = timedelta(seconds=30)
 _T_ADVANCE = timedelta(minutes=5)   # a single graph hop (may run extract/decision)
@@ -49,10 +50,13 @@ class GraphOrchestratorWorkflow:
 
     @workflow.run
     async def run(self, txn_id: str, pdd: dict) -> str:
-        self._roles = pdd.get("roles", {})
-        self._notifications = pdd.get("notifications", [])
-        self._mailbox = pdd.get("mailbox")
-        nodes = {n["id"]: n for n in pdd.get("nodes", []) if "id" in n}
+        # Read the PDD through the tolerant normalizer so ANY dialect works and a
+        # quorum is detected from completion.n/of on any step (not by step name).
+        norm = normalize_pdd(pdd)
+        self._roles = norm["roles"]
+        self._notifications = norm["notifications"]
+        self._mailbox = norm["mailbox"]
+        nodes = norm["nodes_by_id"]
 
         await workflow.execute_activity(
             append_event, args=[txn_id, "engine", "WORKFLOW_RUNNING", "LangGraph", "started"],
@@ -76,7 +80,7 @@ class GraphOrchestratorWorkflow:
 
     # ---- human wait (durable) --------------------------------------------
     async def _handle_human(self, txn_id, node):
-        if (node.get("completion") or {}).get("mode") == "quorum":
+        if is_quorum(node):
             approved = await self._quorum(txn_id, node)
             return {"approved": approved, "decision": "approve" if approved else "reject"}
         return await self._await_human(txn_id, node)
@@ -88,9 +92,8 @@ class GraphOrchestratorWorkflow:
             notify, args=[txn_id, "email", message, recipient, self._mailbox],
             start_to_close_timeout=_T_SHORT)
 
-        timeout_cfg = node.get("timeout") or {}
-        sla_hours = timeout_cfg.get("slaHours") or 48
-        on_timeout = timeout_cfg.get("on_timeout", "remind")
+        sla_hours = node.get("sla_hours") or 48
+        on_timeout = node.get("on_timeout") or "remind"
         if not await workflow.wait_condition(lambda: self._signal is not None,
                                              timeout=timedelta(hours=sla_hours)):
             if on_timeout == "auto_approve":
@@ -147,9 +150,12 @@ class GraphOrchestratorWorkflow:
             if rule.get("to"):
                 return {"to": rule["to"]}
         if node:
-            logical = (node.get("assignment") or {}).get("role")
+            # canonical node -> node['role']; raw node -> assignment.role / role
+            logical = (node.get("role")
+                       or (node.get("assignment") or {}).get("role")
+                       or ((node.get("raw") or {}).get("assignment") or {}).get("role"))
             if logical:
-                return {"to_role": self._roles.get(logical)}
+                return {"to_role": self._roles.get(logical, logical)}
         return None
 
     def _task_notification(self, node):

@@ -30,6 +30,17 @@ def _run(coro):
     return coro
 
 
+def _node_role(node):
+    """Logical role of a human step. Works for a canonical node (node['role'])
+    and for a raw PDD node (assignment.role / role), so either shape is safe."""
+    if not isinstance(node, dict):
+        return None
+    return (node.get("role")
+            or (node.get("assignment") or {}).get("role")
+            or ((node.get("raw") or {}).get("assignment") or {}).get("role")
+            or (node.get("raw") or {}).get("role"))
+
+
 class RealHandlers(Handlers):
     def __init__(self, pdd: dict):
         self._roles = (pdd or {}).get("roles", {})
@@ -53,6 +64,9 @@ class RealHandlers(Handlers):
     def open_human(self, txn_id, node, missing=None):
         # Create the task row (and, for a quorum, the participant slots). The
         # Temporal orchestrator handles reminders/SLA and the actual wait.
+        # `node` is a CANONICAL node (see pdd_norm): the role lives at node['role']
+        # and a quorum is detected from completion.n/of on ANY step — never from
+        # the step being named "finance".
         import invoice_activities as A
         completion = node.get("completion") or {}
         policy = {"kind": node["id"]}
@@ -62,9 +76,8 @@ class RealHandlers(Handlers):
             policy["need"] = missing
         if completion.get("mode") == "quorum":
             policy["quorum"] = {"n": completion.get("n"), "of": completion.get("of")}
-            policy["rejectShortCircuits"] = completion.get("rejectShortCircuits")
-        _run(A.create_human_task(
-            txn_id, node["id"], self._role((node.get("assignment") or {}).get("role")), policy))
+            policy["rejectShortCircuits"] = bool(completion.get("rejectShortCircuits"))
+        _run(A.create_human_task(txn_id, node["id"], self._role(_node_role(node)), policy))
 
     def finish(self, txn_id, data, outcome):
         import invoice_activities as A
