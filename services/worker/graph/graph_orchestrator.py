@@ -66,30 +66,48 @@ class GraphOrchestratorWorkflow:
         status = await workflow.execute_activity(
             graph_advance, args=[txn_id, pdd, None], start_to_close_timeout=_T_ADVANCE)
 
+        self._process_key = norm.get("process_key") or "request"
         while status.get("status") == "paused":
             node = nodes.get(status.get("node"))
             if node is None:
                 raise ApplicationError(f"paused on unknown node '{status.get('node')}'", non_retryable=True)
-            decision = await self._handle_human(txn_id, node)
+            decision = await self._handle_human(
+                txn_id, node, status.get("data") or {}, status.get("missing") or [])
             status = await workflow.execute_activity(
                 graph_advance, args=[txn_id, pdd, decision], start_to_close_timeout=_T_ADVANCE)
 
         outcome = status.get("outcome", "completed")
-        await self._notify_completed(txn_id, outcome)
+        await self._notify_completed(txn_id, outcome, status.get("data") or {})
         return outcome
 
     # ---- human wait (durable) --------------------------------------------
-    async def _handle_human(self, txn_id, node):
+    async def _handle_human(self, txn_id, node, data=None, missing=None):
         if is_quorum(node):
-            approved = await self._quorum(txn_id, node)
+            approved = await self._quorum(txn_id, node, data, missing)
             return {"approved": approved, "decision": "approve" if approved else "reject"}
-        return await self._await_human(txn_id, node)
+        return await self._await_human(txn_id, node, data, missing)
 
-    async def _await_human(self, txn_id, node):
+    def _email_context(self, node, data, missing):
+        """What the email writer needs. A step that asked for missing fields is a
+        'request_info' style email (whatever the step is called)."""
+        return {
+            "kind": "request_info" if missing else "task",
+            "process": getattr(self, "_process_key", "request"),
+            "step": node.get("id"),
+            "data": data or {},
+            "missing": missing or [],
+        }
+
+    async def _await_human(self, txn_id, node, data=None, missing=None):
         self._signal = None
         message, recipient = self._task_notification(node)
+        # A step that needs missing fields emails the SUBMITTER (they supply them);
+        # a pure approval step emails the assigned role.
+        if missing:
+            recipient = {"to": "submitter"}
         await workflow.execute_activity(
-            notify, args=[txn_id, "email", message, recipient, self._mailbox],
+            notify, args=[txn_id, "email", message, recipient, self._mailbox,
+                          self._email_context(node, data, missing)],
             start_to_close_timeout=_T_SHORT)
 
         sla_hours = node.get("sla_hours") or 48
@@ -106,7 +124,7 @@ class GraphOrchestratorWorkflow:
             await workflow.wait_condition(lambda: self._signal is not None)
         return self._signal
 
-    async def _quorum(self, txn_id, node) -> bool:
+    async def _quorum(self, txn_id, node, data=None, missing=None) -> bool:
         self._votes = {}
         self._finance_result = None
         completion = node.get("completion") or {}
@@ -116,7 +134,8 @@ class GraphOrchestratorWorkflow:
 
         message, recipient = self._task_notification(node)
         await workflow.execute_activity(
-            notify, args=[txn_id, "email", message, recipient, self._mailbox],
+            notify, args=[txn_id, "email", message, recipient, self._mailbox,
+                          self._email_context(node, data, missing)],
             start_to_close_timeout=_T_SHORT)
 
         def decided():
@@ -164,10 +183,12 @@ class GraphOrchestratorWorkflow:
             return rule.get("template", f"Action needed: {node['id']}"), self._recipient_from_rule(rule, node)
         return f"Action needed: {node['id']}", self._recipient_from_rule(None, node)
 
-    async def _notify_completed(self, txn_id, outcome):
+    async def _notify_completed(self, txn_id, outcome, data=None):
         rule = self._notify_rule(f"completed:{outcome}")
         message = (rule.get("template") if rule else None) or f"Process {outcome}"
         recipient = self._recipient_from_rule(rule) if rule else {"to": "submitter"}
+        context = {"kind": "outcome", "process": getattr(self, "_process_key", "request"),
+                   "outcome": outcome, "data": data or {}}
         await workflow.execute_activity(
-            notify, args=[txn_id, "email", message, recipient, self._mailbox],
+            notify, args=[txn_id, "email", message, recipient, self._mailbox, context],
             start_to_close_timeout=_T_SHORT)

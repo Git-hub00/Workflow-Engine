@@ -34,13 +34,24 @@ def _default_mailbox():
 
 
 def get_mailbox(name=None):
-    """Resolve a mailbox by name. Returns a dict with address/app_password/hosts,
-    or the default mailbox if the name is missing/unconfigured, or None if nothing
-    is configured at all."""
+    """Resolve a mailbox by name.
+
+    ONE GMAIL = ONE PROCESS. If a process names a mailbox, that mailbox's own
+    credentials MUST be configured — we never silently fall back to another
+    account, because that would send a process's mail from the wrong address.
+    A missing configuration returns None so the caller can log it loudly.
+    Only a process with NO mailbox name at all uses the default account."""
     if name:
         k = _key(name)
         addr = os.getenv(f"MAILBOX_{k}_ADDRESS")
         pw = os.getenv(f"MAILBOX_{k}_APP_PASSWORD")
+        if not (addr and pw):
+            # The "default" name may be served by the legacy GMAIL_* pair.
+            if _key(name) == "DEFAULT":
+                return _default_mailbox()
+            print(f"mailbox '{name}' is not configured: set MAILBOX_{k}_ADDRESS "
+                  f"and MAILBOX_{k}_APP_PASSWORD")
+            return None
         if addr and pw:
             return {
                 "name": name,

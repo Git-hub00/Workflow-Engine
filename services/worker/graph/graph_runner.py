@@ -40,10 +40,15 @@ def _checkpointer():
 
 
 def _status(state) -> dict:
+    """Report where the run stopped, PLUS the context the notification needs
+    (the request's data and the fields the decision found missing) so the email
+    can say exactly what the person must provide."""
+    state = state or {}
     interrupts = state.get("__interrupt__") if isinstance(state, dict) else None
+    common = {"data": state.get("data") or {}, "missing": state.get("missing") or []}
     if interrupts:
-        return {"status": "paused", "node": interrupts[0].value.get("node")}
-    return {"status": "done", "outcome": (state or {}).get("outcome", "completed")}
+        return {"status": "paused", "node": interrupts[0].value.get("node"), **common}
+    return {"status": "done", "outcome": state.get("outcome", "completed"), **common}
 
 
 def advance(txn_id: str, pdd: dict, resume=None) -> dict:

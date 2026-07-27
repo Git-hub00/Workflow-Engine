@@ -136,21 +136,28 @@ export function ProcessBuilder() {
   const [busy, setBusy] = useState(false)
 
   const [loadedKey, setLoadedKey] = useState(null)
+  const [processList, setProcessList] = useState([])   // every process the author can edit
 
   useEffect(() => { get('/v1/roles').then((r) => setRoles(Array.isArray(r) ? r : [])).catch(() => setRoles([])) }, [])
 
-  // One workflow at a time: load the active process so it's editable. The author
-  // edits this and re-publishes (publishing updates the single active process).
-  useEffect(() => {
-    get('/v1/active-process').then((pdd) => {
-      if (pdd && Array.isArray(pdd.nodes) && pdd.nodes.length) {
-        const s = pddToState(pdd)
-        setProcessKey(s.processKey); setMailbox(s.mailbox); setConfig(s.config)
-        setDataFields(s.dataFields); setSteps(s.steps); setNotifications(s.notifications)
-        setLoadedKey(s.processKey)
-      }
-    }).catch(() => {})
-  }, [])
+  // MANY workflows: list them all so the author can switch between them.
+  const refreshList = () => get('/v1/definitions')
+    .then((rows) => setProcessList((rows || []).map((r) => r.process_key).filter(Boolean)))
+    .catch(() => setProcessList([]))
+  useEffect(() => { refreshList() }, [])
+
+  // Load one process into the editor (click its button in the strip).
+  function loadProcess(key) {
+    if (!key) return
+    setFeedback(null); setValidation(null)
+    get(`/v1/definitions/${encodeURIComponent(key)}`).then((pdd) => {
+      if (!pdd || !Array.isArray(pdd.nodes)) return
+      const s = pddToState(pdd)
+      setProcessKey(s.processKey); setMailbox(s.mailbox); setConfig(s.config)
+      setDataFields(s.dataFields); setSteps(s.steps); setNotifications(s.notifications)
+      setLoadedKey(s.processKey)
+    }).catch((e) => setFeedback({ type: 'error', message: e.message || String(e) }))
+  }
 
   function newBlank() {
     setProcessKey(''); setMailbox(''); setConfig([]); setDataFields([]); setSteps([]); setNotifications([])
@@ -308,6 +315,7 @@ export function ProcessBuilder() {
     const perStep = {}
     const general = []
     if (!processKey.trim()) general.push('Give the process a name (key).')
+    if (!mailbox.trim()) general.push('Set a mailbox name.')
     if (steps.length === 0) general.push('Add at least one step.')
     if (!steps.some((s) => s.kind === 'finish')) general.push('Add a Finish step.')
     const names = steps.map((s) => s.name)
@@ -337,7 +345,7 @@ export function ProcessBuilder() {
     })
     const count = general.length + steps.reduce((a, s) => a + Object.keys(perStep[s.key] || {}).length, 0)
     return { perStep, general, count }
-  }, [processKey, steps, dataFields, config])
+  }, [processKey, mailbox, steps, dataFields, config])
 
   async function validate() {
     setBusy(true); setFeedback(null)
@@ -349,7 +357,10 @@ export function ProcessBuilder() {
     setBusy(true); setFeedback(null)
     try {
       const res = await post('/v1/definitions', { pdd })
-      setFeedback({ type: 'success', message: `Published '${res.process_key}' v${res.version}.` })
+      // Version numbers are intentionally NOT shown — the author just saves.
+      setFeedback({ type: 'success', message: `Saved “${res.process_key}”.` })
+      setLoadedKey(res.process_key)
+      refreshList()
     } catch (e) {
       setFeedback({ type: 'error', message: e.message || String(e) })
     } finally { setBusy(false) }
@@ -376,10 +387,21 @@ export function ProcessBuilder() {
           <p className="eyebrow">Design time</p>
           <h2 id="builder-heading">Process Builder</h2>
           <p>{loadedKey
-            ? `Editing “${loadedKey}”. Change anything and Publish to update the active workflow.`
-            : 'Add steps on the left in plain language — the flow draws itself on the right. Fix any red hints, then Publish.'}</p>
+            ? `Editing “${loadedKey}”. Change anything and Save to update this workflow.`
+            : 'Add steps on the left in plain language — the flow draws itself on the right. Fix any red hints, then Save.'}</p>
         </div>
-        <button type="button" className="secondary-button" onClick={newBlank}>New blank process</button>
+      </div>
+
+      {/* All workflows on one scrollable line: blue New first, then each process. */}
+      <div className="process-strip" role="tablist" aria-label="Your workflows">
+        <button type="button" className={`process-chip new ${loadedKey === null ? 'active' : ''}`}
+          onClick={newBlank}>+ New</button>
+        {processList.map((key) => (
+          <button type="button" key={key} role="tab" aria-selected={loadedKey === key}
+            className={`process-chip ${loadedKey === key ? 'active' : ''}`}
+            onClick={() => loadProcess(key)}>{key}</button>
+        ))}
+        {processList.length === 0 && <span className="muted">No workflows yet — click “+ New” to build your first one.</span>}
       </div>
 
       <div className="builder-layout">
@@ -391,8 +413,13 @@ export function ProcessBuilder() {
               <label className="config-field"><span>Name (key) *</span>
                 <input value={processKey} placeholder="e.g. invoice_approval" onChange={(e) => setProcessKey(e.target.value)} />
                 <Err msg={errs.general.includes('Give the process a name (key).') ? 'Required' : null} /></label>
-              <label className="config-field"><span>Mailbox (optional)</span>
-                <input value={mailbox} placeholder="e.g. invoice" onChange={(e) => setMailbox(e.target.value)} /></label>
+              <label className="config-field"><span>Mailbox *</span>
+                <input value={mailbox} placeholder="e.g. invoice" onChange={(e) => setMailbox(e.target.value)} />
+                <span className="muted" style={{ fontSize: '0.75rem' }}>
+                  This workflow&apos;s own Gmail. Admin must set MAILBOX_{(mailbox || 'NAME').toUpperCase().replace(/[- ]/g, '_')}_ADDRESS
+                  and _APP_PASSWORD. One Gmail per workflow — never shared.
+                </span>
+                <Err msg={errs.general.includes('Set a mailbox name.') ? 'Required — mail cannot start this workflow without it' : null} /></label>
             </div>
           </section>
 
@@ -618,7 +645,7 @@ export function ProcessBuilder() {
             {feedback && <p className={`feedback ${feedback.type}`}>{feedback.message}</p>}
             <button type="button" className="secondary-button" onClick={validate} disabled={busy}>Validate on server</button>
             <button type="button" className="primary-button" onClick={publish} disabled={busy || errs.count > 0}>
-              {errs.count > 0 ? `Fix ${errs.count} issue${errs.count === 1 ? '' : 's'}` : 'Publish'}
+              {errs.count > 0 ? `Fix ${errs.count} issue${errs.count === 1 ? '' : 's'}` : (loadedKey ? 'Save changes' : 'Save workflow')}
             </button>
           </div>
         </div>

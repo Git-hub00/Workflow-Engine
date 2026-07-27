@@ -109,7 +109,7 @@ class Handlers:
     def run_action(self, txn_id, action, data):        # automated
         return data
 
-    def decide(self, node, data, cfg):                 # decision -> {route, missing, rationale}
+    def decide(self, node, data, cfg, txn_id=None):    # decision -> {route, missing, rationale}
         return {"route": None}
 
     def run_human(self, txn_id, node):                 # human (sync mode)
@@ -155,7 +155,7 @@ def _make_node_fn(node, cfg, h):
         if ntype == "automated":
             upd["data"] = h.run_action(state["txn_id"], node.get("action"), data) or data
         elif ntype == "decision":
-            res = h.decide(node, data, cfg) or {}
+            res = h.decide(node, data, cfg, state["txn_id"]) or {}
             upd["route"] = res.get("route")
             upd["missing"] = res.get("missing") or []
         elif ntype == "timer":

@@ -222,25 +222,28 @@ async def create_human_task(txn_id: str, node_id: str, role: str, policy: dict |
     token = uuid.uuid4().hex  # opaque unique claim token for this task
     policy_json = json.dumps(policy) if policy is not None else None
 
+    # A MULTI-APPROVER (quorum) step is recognised from its policy, never from the
+    # step being named "finance" — so a quorum step can be called panel,
+    # committee, board, … in any workflow.
+    _q = policy.get("quorum") if isinstance(policy, dict) else None
+    is_quorum = isinstance(_q, dict) and _q.get("n") is not None and _q.get("of") is not None
+
     finance_capacity = None
-    if node_id == "finance":
-        quorum = policy.get("quorum") if isinstance(policy, dict) else None
-        required = quorum.get("n") if isinstance(quorum, dict) else None
-        finance_capacity = quorum.get("of") if isinstance(quorum, dict) else None
-        reject_short_circuits = (
-            policy.get("rejectShortCircuits") if isinstance(policy, dict) else None
-        )
+    if is_quorum:
+        required = _q.get("n")
+        finance_capacity = _q.get("of")
+        reject_short_circuits = policy.get("rejectShortCircuits")
         if (
             type(required) is not int
             or type(finance_capacity) is not int
             or not 1 <= required <= finance_capacity
         ):
             raise ValueError(
-                "invalid Finance quorum: expected integers satisfying 1 <= quorum.n <= quorum.of"
+                f"invalid quorum on step '{node_id}': expected integers satisfying 1 <= n <= of"
             )
         if type(reject_short_circuits) is not bool:
             raise ValueError(
-                "invalid Finance configuration: rejectShortCircuits must be a boolean"
+                f"invalid quorum on step '{node_id}': rejectShortCircuits must be a boolean"
             )
 
     # The task row, any participant_task rows, AND the TASK_CREATED audit event
@@ -249,9 +252,9 @@ async def create_human_task(txn_id: str, node_id: str, role: str, policy: dict |
     # business rows (strict atomicity — never a task without its audit event, or
     # an audit event without its task).
     with engine.begin() as conn:
-        if node_id == "finance":
+        if is_quorum:
             # Lock the transaction projection so an overlapping Temporal activity
-            # retry cannot create a second Finance parent task.
+            # retry cannot create a second parent task for this quorum step.
             conn.execute(
                 text('SELECT id FROM "transaction" WHERE id = CAST(:txn AS uuid) FOR UPDATE'),
                 {"txn": txn_id},
@@ -259,10 +262,10 @@ async def create_human_task(txn_id: str, node_id: str, role: str, policy: dict |
             existing = conn.execute(
                 text(
                     "SELECT id, token, status, completion_policy FROM task "
-                    "WHERE transaction_id = CAST(:txn AS uuid) AND node_id = 'finance' "
+                    "WHERE transaction_id = CAST(:txn AS uuid) AND node_id = :node_id "
                     "ORDER BY created_at LIMIT 1"
                 ),
-                {"txn": txn_id},
+                {"txn": txn_id, "node_id": node_id},
             ).mappings().first()
             if existing is not None:
                 existing_policy = existing["completion_policy"] or {}
@@ -316,10 +319,7 @@ async def create_human_task(txn_id: str, node_id: str, role: str, policy: dict |
 
         # If the policy defines a quorum {"n": needed, "of": total}, pre-create
         # `of` participant_task rows (participant left NULL until assigned).
-        quorum = policy.get("quorum") if isinstance(policy, dict) else None
-        total = finance_capacity if node_id == "finance" else (
-            quorum.get("of") if isinstance(quorum, dict) else None
-        )
+        total = finance_capacity if is_quorum else None
         if type(total) is int and total > 0:
             for _ in range(total):
                 conn.execute(
@@ -443,9 +443,38 @@ def _kc_admin_token(kc: str) -> str | None:
         return None
 
 
-def _emails_for_role(role: str) -> list:
-    # Every Keycloak user holding `role`, with an email. Drives role-based
-    # notifications (e.g. email the ap_manager(s) when an approval task appears).
+def _process_key_for_txn(txn_id: str):
+    """Which workflow this transaction belongs to."""
+    try:
+        with engine.connect() as conn:
+            return conn.execute(
+                text('SELECT pd.process_key FROM "transaction" tr '
+                     "JOIN definition_version dv ON dv.id = tr.definition_version_id "
+                     "JOIN process_definition pd ON pd.id = dv.definition_id "
+                     "WHERE tr.id = CAST(:id AS uuid)"),
+                {"id": txn_id}).scalar_one_or_none()
+    except Exception as exc:
+        print(f"notify: process lookup failed: {exc}")
+        return None
+
+
+def _usernames_for_process(process_key: str):
+    """Who is assigned to this workflow. None = table missing -> do not filter."""
+    if not process_key:
+        return None
+    try:
+        with engine.connect() as conn:
+            return set(conn.execute(
+                text("SELECT username FROM user_process WHERE process_key = :p"),
+                {"p": process_key}).scalars().all())
+    except Exception:
+        return None
+
+
+def _emails_for_role(role: str, process_key: str | None = None) -> list:
+    # Every Keycloak user holding `role` — narrowed to the people assigned to THIS
+    # workflow. Both invoice and leave may use the role `manager`, so an invoice
+    # task must only reach the managers assigned to invoice.
     if not role:
         return []
     kc = os.getenv("KEYCLOAK_URL", "http://localhost:8081")
@@ -461,7 +490,15 @@ def _emails_for_role(role: str) -> list:
     except Exception as exc:
         print(f"notify: role-email lookup failed for {role!r}: {exc}")
         return []
-    return [u["email"] for u in users if isinstance(u, dict) and u.get("email")]
+    holders = [u for u in users if isinstance(u, dict) and u.get("email")]
+    assigned = _usernames_for_process(process_key)
+    if assigned is not None:
+        scoped = [u for u in holders if u.get("username") in assigned]
+        if not scoped:
+            print(f"notify: nobody with role {role!r} is assigned to process "
+                  f"{process_key!r} — no recipients")
+        return [u["email"] for u in scoped]
+    return [u["email"] for u in holders]
 
 
 def _fallback_recipients() -> list:
@@ -484,7 +521,10 @@ def _resolve_recipients(txn_id: str, recipient: dict | None) -> list:
         email = _submitted_by_email(txn_id)
         return [email] if email else _fallback_recipients()
     if recipient.get("to_role"):
-        return _emails_for_role(recipient["to_role"]) or _fallback_recipients()
+        # Scope role recipients to the people assigned to THIS workflow. No
+        # NOTIFY_TO fallback here: mailing an unrelated inbox would leak another
+        # team's work — an empty result is logged instead.
+        return _emails_for_role(recipient["to_role"], _process_key_for_txn(txn_id))
     return _fallback_recipients()
 
 
@@ -499,9 +539,84 @@ def _get_mailbox(name):
     return get_mailbox(name)
 
 
+def _known_details(data: dict) -> str:
+    if not isinstance(data, dict) or not data:
+        return ""
+    return "\n".join(f"  - {k}: {v}" for k, v in data.items() if v not in (None, ""))
+
+
+def _compose_email(context: dict, fallback: str) -> tuple[str, str]:
+    """Write the subject + body for a notification.
+
+    The LLM only writes the WORDING. Every fact that must be exact — the list of
+    missing fields and the reply format — is appended by code afterwards, so a
+    slow or creative model can never lose or invent them. Any failure falls back
+    to a clear deterministic message; email must never break the workflow."""
+    context = context or {}
+    kind = context.get("kind") or "task"
+    process = context.get("process") or "request"
+    step = context.get("step") or ""
+    missing = [m for m in (context.get("missing") or []) if m]
+    data = context.get("data") or {}
+    outcome = context.get("outcome")
+
+    # 1. Deterministic baseline (always correct, used as-is if the LLM is down).
+    if kind == "request_info":
+        subject = f"More information needed for your {process.replace('_', ' ')}"
+        body = ("Hello,\n\nWe received your request but we still need a few details "
+                "before it can continue.")
+    elif kind == "outcome":
+        subject = f"Your {process.replace('_', ' ')} was {outcome}"
+        body = f"Hello,\n\nYour request has been {outcome}."
+    else:
+        subject = f"Action needed: {step or process}"
+        body = (f"Hello,\n\nA request in '{process}' is waiting for your approval "
+                f"at the '{step}' step.")
+
+    # 2. Optional LLM rewrite of just the greeting/explanation.
+    try:
+        import os
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(
+            base_url=os.getenv("LLM_BASE_URL", "http://localhost:11434/v1"),
+            api_key="ollama", model=os.getenv("LLM_MODEL", "llama3.2:1b"),
+            temperature=0, timeout=float(os.getenv("LLM_EMAIL_TIMEOUT", "25")),
+        )
+        prompt = (
+            f"Write a short, polite business email body (3 sentences max, no subject "
+            f"line, no placeholders, no markdown) for this workflow event.\n"
+            f"Process: {process}\nStep: {step}\nSituation: {kind}"
+            + (f"\nOutcome: {outcome}" if outcome else "")
+            + (f"\nDetails we already have: {data}" if data else "")
+            + (f"\nInformation still required: {', '.join(missing)}" if missing else "")
+            + "\nDo NOT invent facts, amounts or dates. Do not list the required "
+              "fields yourself; they are appended separately."
+        )
+        text_out = (llm.invoke(prompt).content or "").strip()
+        if text_out:
+            body = text_out
+    except Exception as exc:
+        print(f"notify: LLM email wording unavailable, using plain text ({exc})")
+
+    # 3. Append the authoritative facts (never LLM-generated).
+    details = _known_details(data)
+    if kind == "request_info":
+        wanted = missing or ["the missing details"]
+        body += ("\n\nWhat we already have:\n" + details if details else "")
+        body += ("\n\nPlease REPLY to this email with one line per item, exactly like this:\n"
+                 + "\n".join(f"{field}: <value>" for field in wanted))
+        body += "\n\nJust reply to this message — you do not need any reference number."
+    elif kind == "task":
+        body += ("\n\nRequest details:\n" + details if details else "")
+        body += "\n\nOpen the app to approve or reject, or reply with 'approve' or 'reject'."
+    else:
+        body += ("\n\nRequest details:\n" + details if details else "")
+    return subject, body or fallback
+
+
 @activity.defn
 async def notify(txn_id: str, channel: str, message: str, recipient: dict | None = None,
-                 mailbox: str | None = None) -> None:
+                 mailbox: str | None = None, context: dict | None = None) -> None:
     # Recipients come from the PDD notification rule the interpreter passes
     # (role / submitter / literal), NOT hardcoded — so manager tasks reach
     # managers, finance tasks reach finance, and approvals/rejections reach the
@@ -532,16 +647,23 @@ async def notify(txn_id: str, channel: str, message: str, recipient: dict | None
         print("notify: no sender mailbox configured or no recipients resolved; skipping send")
         return
 
+    # Subject + body: AI writes the wording, code guarantees the facts (missing
+    # fields, reply format). Without context we simply send the plain message.
+    if context:
+        subject, body = _compose_email(context, message)
+    else:
+        subject, body = message, message
+
     msg = EmailMessage()
     # The [invoice-<txn_id>] tag ties replies back to this run (email adapter 9.3).
-    msg["Subject"] = f"[invoice-{txn_id}] {message}"
+    msg["Subject"] = f"[invoice-{txn_id}] {subject}"
     msg["From"] = box["address"]
     msg["To"] = ", ".join(recipients)
     # Send just the message. (The old hardcoded "reply with approve/reject/return"
     # line was wrong on final notifications and triggered Gmail's smart-reply
     # buttons. If a specific step wants a reply hint, put it in that step's
     # notification template in the PDD.)
-    msg.set_content(message)
+    msg.set_content(body)
 
     try:
         with smtplib.SMTP(box["smtp_host"], box["smtp_port"]) as server:

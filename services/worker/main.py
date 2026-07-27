@@ -50,8 +50,7 @@ from invoice_activities import (  # noqa: E402  (import after sys.path tweak)
     post_to_erp,
     set_transaction_status,
 )
-from process_interpreter import ProcessInterpreterWorkflow  # noqa: E402  (Temporal engine, fallback)
-from graph_orchestrator import GraphOrchestratorWorkflow  # noqa: E402  (LangGraph engine)
+from graph_orchestrator import GraphOrchestratorWorkflow  # noqa: E402  (THE engine: LangGraph)
 from graph_activities import graph_advance  # noqa: E402  (sync activity: runs the LangGraph run)
 
 
@@ -64,9 +63,8 @@ async def main():
     worker_main = Worker(
         client,
         task_queue="invoice-tq",
-        # Both engines are registered; the API starts whichever ORCHESTRATOR selects.
         # graph_advance is a SYNC activity (runs the LangGraph run in a worker thread).
-        workflows=[ProcessInterpreterWorkflow, GraphOrchestratorWorkflow],
+        workflows=[GraphOrchestratorWorkflow],
         activities=[append_event, extract_fields, create_human_task, notify, post_to_erp,
                     set_transaction_status, graph_advance],
         activity_executor=ThreadPoolExecutor(max_workers=8),

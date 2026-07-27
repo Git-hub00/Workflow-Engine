@@ -201,7 +201,7 @@ function TaskInbox({ roles, username }) {
       const result = await post(`/v1/tasks/${encodeURIComponent(task.token)}/claim`, {
         claimed_by: username,
       })
-      if (task.node_id === 'finance') {
+      if (task.is_quorum) {
         await loadTasks(false)
       } else {
         setTasks((current) =>
@@ -217,7 +217,7 @@ function TaskInbox({ roles, username }) {
         [task.token]: {
           type: 'success',
           message:
-            task.node_id === 'finance'
+            task.is_quorum
               ? `Finance slot ${result.participant_id} claimed. You can now submit one decision.`
               : 'Task claimed. You can now submit a decision.',
         },
@@ -237,7 +237,7 @@ function TaskInbox({ roles, username }) {
     // the UI for rejections and travels in the payload so it lands in the audit
     // event (HUMAN_DECISION / FINANCE_VOTE) and the vendor rejection email.
     const decision = decisionArg || 'approve'
-    const isFinanceTask = task.node_id === 'finance'
+    const isFinanceTask = !!task.is_quorum
     setBusyAction(`${task.token}:complete`)
     setFeedback((current) => ({ ...current, [task.token]: null }))
 
@@ -366,7 +366,7 @@ function TaskInbox({ roles, username }) {
             latestLlmDecision?.payload?.rationale ||
             latestLlmDecision?.detail ||
             latestLlmDecision?.payload?.detail
-          const isFinanceTask = task.node_id === 'finance'
+          const isFinanceTask = !!task.is_quorum
           const isClaimedByUser = task.status === 'claimed' && task.claimed_by === username
           // Generic form fields from the PDD (non-finance only; finance keeps the quorum widget).
           const taskFields = isFinanceTask ? null : formSchemaFor(task)

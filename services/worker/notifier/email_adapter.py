@@ -138,27 +138,25 @@ def _get_pdd(api_base_url: str, process_key: str):
     return None
 
 
-def _get_active_pdd(api_base_url: str):
-    # The single active (latest published) process, or None.
-    try:
-        r = requests.get(f"{api_base_url}/v1/active-process", timeout=10)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-    return None
+def _mailbox_key(name) -> str:
+    # Mailbox names are compared case-insensitively and -/_ insensitively, because
+    # the registry derives names from env vars (MAILBOX_INVOICE_ADDRESS -> INVOICE)
+    # while the Builder stores what the author typed ("invoice").
+    return str(name or "").strip().upper().replace("-", "_")
 
 
 def _process_for_mailbox(api_base_url: str, mailbox_name: str):
-    # Find the published process whose PDD is bound to this mailbox (pdd.mailbox).
+    # Find the published process bound to THIS mailbox (pdd.mailbox). One Gmail
+    # serves exactly one process, so the first match is the answer.
     try:
         defs = requests.get(f"{api_base_url}/v1/definitions", timeout=10).json()
     except Exception:
         return None, None
+    want = _mailbox_key(mailbox_name)
     for d in defs if isinstance(defs, list) else []:
         pk = d.get("process_key")
         pdd = _get_pdd(api_base_url, pk)
-        if pdd and pdd.get("mailbox") == mailbox_name:
+        if pdd and _mailbox_key(pdd.get("mailbox")) == want:
             return pk, pdd
     return None, None
 
@@ -230,19 +228,14 @@ def _process_new_transaction(msg, api_base_url: str, mailbox_name: str) -> str:
     subject = decode_subject(msg.get("Subject", ""))
     sender = _sender_email(msg)
 
-    process_key = _process_from_subject(subject)
-    pdd = _get_pdd(api_base_url, process_key) if process_key else None
-    if process_key and pdd is None:
-        return f"skipped (subject names unknown process {process_key!r}) status=none"
+    # STRICT MAILBOX BINDING: the process is decided ONLY by which mailbox the
+    # mail arrived in (pdd.mailbox == this mailbox's name). One Gmail = one
+    # process. No [start:...] subject selection and no "default/active process"
+    # fallback — so mail can never start the wrong workflow.
+    process_key, pdd = _process_for_mailbox(api_base_url, mailbox_name)
     if not process_key:
-        process_key, pdd = _process_for_mailbox(api_base_url, mailbox_name)
-    if not process_key:
-        # Single-workflow fallback: with one active process, ANY subject starts it
-        # (no [start:...] tag or mailbox binding required).
-        pdd = _get_active_pdd(api_base_url)
-        process_key = (pdd or {}).get("process_key")
-    if not process_key:
-        return "skipped (no active process to start) status=none"
+        return (f"skipped (mailbox {mailbox_name!r} is not bound to any published process; "
+                f"set that process's Mailbox field to {mailbox_name!r}) status=none")
 
     data_schema = (pdd or {}).get("data_schema") or {}
 
@@ -313,16 +306,28 @@ def _process_tagged_reply(txn_id: str, msg, message_id: str, api_base_url: str) 
         # DEDUP: the other channel (app) already closed the task / the step passed.
         return f"skipped (no open task for {txn_id}; already handled) status=none"
 
+    # GENERIC reply handling — works for ANY step name in ANY workflow.
+    #   * the step asked for missing fields  -> parse "field: value" lines
+    #   * otherwise it is an approval step   -> read approve / reject from the text
     node = open_task.get("node_id")
-    if node == "request_info":
-        payload = {"decision": "resubmit", "data": _parse_field_lines(body, open_task.get("need"))}
-    elif node == "manager":
+    need = open_task.get("need")
+    if need:
+        provided = _parse_field_lines(body, need)
+        if not provided:
+            return (f"skipped (reply to {node!r} had no 'field: value' lines for {need}) "
+                    "status=none")
+        payload = {"decision": "resubmit", "data": provided}
+    else:
         decision = extract_decision(body)
         if decision is None:
-            return "skipped (tagged reply with no decision)"
-        payload = {"decision": decision}
-    else:
-        return f"skipped (open task {node!r} is not email-actionable) status=none"
+            # Maybe it is a data step whose fields we can still parse.
+            provided = _parse_field_lines(body, None)
+            if provided:
+                payload = {"decision": "resubmit", "data": provided}
+            else:
+                return f"skipped (reply to {node!r} had no decision) status=none"
+        else:
+            payload = {"decision": decision}
 
     request_body = {
         "transaction_id": txn_id,

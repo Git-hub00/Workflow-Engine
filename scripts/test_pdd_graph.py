@@ -59,7 +59,7 @@ class MockHandlers(Handlers):
     def run_action(self, txn_id, action, data):
         return {**data, "posted": True}
 
-    def decide(self, node, data, cfg):
+    def decide(self, node, data, cfg, txn_id=None):
         if not data.get("ref"):
             return {"route": "INFO"}
         return {"route": "AUTO"} if float(data.get("amount", 0)) < 500 else {"route": "MGR"}

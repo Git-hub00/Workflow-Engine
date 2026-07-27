@@ -57,9 +57,31 @@ class RealHandlers(Handlers):
             return data
         return data
 
-    def decide(self, node, data, cfg):
+    def decide(self, node, data, cfg, txn_id=None):
+        """Run the bounded decision AND record it in the audit trail.
+
+        Without this the Monitor audit and the Task Inbox showed
+        "No LLM_DECISION rationale has been recorded yet", because the LangGraph
+        engine called the decision function directly and nothing was written."""
         from decision_engine import decide
-        return decide(node, data, cfg)
+        result = decide(node, data, cfg) or {}
+        if txn_id:
+            import invoice_activities as A
+            payload = {
+                "route": result.get("route"),
+                "missing": result.get("missing", []),
+                "anomalies": result.get("anomalies", []),
+                "rationale": result.get("rationale", ""),
+                "node_id": node.get("id"),
+            }
+            try:
+                _run(A.append_event(
+                    txn_id, "llm", "LLM_DECISION", "LangGraph",
+                    result.get("rationale") or f"Routed to {result.get('route')}",
+                    payload=payload, idempotency_key=None))
+            except Exception as exc:      # audit must never break the workflow
+                print(f"decide: audit write failed: {exc}")
+        return result
 
     def open_human(self, txn_id, node, missing=None):
         # Create the task row (and, for a quorum, the participant slots). The

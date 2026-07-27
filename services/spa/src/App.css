@@ -1505,6 +1505,25 @@ td.mono {
 .flow-zoom button:hover { background: #f1f5f9; }
 .flow-canvas { border: 1px solid var(--line, #e2e8f0); border-radius: 12px; background: #fbfcfe; }
 
+/* ---- Workflow strip: New + one button per workflow, scrolls sideways --- */
+.process-strip {
+  display: flex; align-items: center; gap: 8px; margin: 0 0 18px;
+  padding-bottom: 8px; overflow-x: auto; white-space: nowrap;
+  scrollbar-width: thin;
+}
+.process-strip::-webkit-scrollbar { height: 7px; }
+.process-strip::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+.process-chip {
+  flex: 0 0 auto; padding: 9px 16px; border-radius: 999px; cursor: pointer;
+  font-size: 0.88rem; font-weight: 600; white-space: nowrap;
+  background: #fff; color: #334155; border: 1px solid var(--line, #cbd5e1);
+}
+.process-chip:hover { border-color: var(--primary, #4f6ef7); color: var(--primary, #4f6ef7); }
+.process-chip.active { border-color: var(--primary, #4f6ef7); background: #eef2ff; color: #3730a3; }
+.process-chip.new { background: var(--primary, #4f6ef7); border-color: var(--primary, #4f6ef7); color: #fff; }
+.process-chip.new:hover { background: #4360e6; color: #fff; }
+.process-chip.new.active { background: #3f56d6; color: #fff; }
+
 /* ---- Guided Process Builder ------------------------------------------- */
 .builder-config > .panel, .builder-config > .adv { margin-bottom: 18px; }
 .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }

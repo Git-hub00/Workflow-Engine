@@ -39,7 +39,8 @@ _SCRIPTS_DIR = SERVICES_DIR.parent / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from process_interpreter import ProcessInterpreterWorkflow  # noqa: E402  (generic engine)
+# (The old Temporal-only interpreter was removed. LangGraph is now THE engine:
+#  the API starts GraphOrchestratorWorkflow by name, so it never imports it.)
 from pdd_validation import validate_pdd  # noqa: E402  (structural PDD checks)
 
 # Module-level SQLAlchemy engine: created once, connection-pooled, reused by every
@@ -207,6 +208,64 @@ def _validate_finance_completion(comp: dict) -> None:
                             detail="invalid quorum: rejectShortCircuits must be true/false")
 
 
+CORE_APP_ROLES = ("ops_admin", "process_author")
+
+
+def _user_processes(username: str) -> list:
+    """Workflows this person takes part in (set by an admin). Fail-safe: if the
+    table is not migrated yet we return None meaning 'do not restrict', so a
+    pending migration can never lock everyone out of their inbox."""
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT process_key FROM user_process WHERE username = :u ORDER BY process_key"),
+                {"u": username},
+            ).scalars().all()
+        return list(rows)
+    except Exception as exc:
+        print(f"user_process lookup failed (not migrated yet?): {exc}")
+        return None
+
+
+def _allowed_processes(user: dict | None):
+    """None = unrestricted (admins, authors, or table missing).
+    []   = assigned to nothing -> sees nothing."""
+    if not user:
+        return None
+    roles = user.get("roles") or []
+    if any(r in roles for r in CORE_APP_ROLES):
+        return None
+    return _user_processes(user.get("username") or "")
+
+
+def _process_scope_sql(allowed, txn_col: str) -> str:
+    """SQL fragment limiting rows to the caller's assigned workflows."""
+    if allowed is None:
+        return ""
+    if not allowed:
+        return " AND 1 = 0 "          # assigned to nothing -> sees nothing
+    keys = ", ".join("'" + str(k).replace("'", "''") + "'" for k in allowed)
+    return (f" AND {txn_col} IN (SELECT tr.id FROM \"transaction\" tr "
+            "JOIN definition_version dv ON dv.id = tr.definition_version_id "
+            "JOIN process_definition pd ON pd.id = dv.definition_id "
+            f"WHERE pd.process_key IN ({keys})) ")
+
+
+def _is_quorum_policy(policy) -> bool:
+    """True when a task is a MULTI-APPROVER (quorum) task.
+
+    Decided from the task's stored completion policy — NOT from the step being
+    called 'finance'. This is what lets a quorum step be named 'panel',
+    'committee', 'board' or anything else in any workflow."""
+    if not isinstance(policy, dict):
+        return False
+    quorum = policy.get("quorum")
+    if isinstance(quorum, dict):
+        return quorum.get("n") is not None and quorum.get("of") is not None
+    # legacy shape: n/of stored at the top level of the policy
+    return policy.get("n") is not None and policy.get("of") is not None
+
+
 def _finance_policy_values(policy: dict) -> tuple[int, int, bool]:
     """Read a Finance task's immutable policy, including the legacy n/of shape."""
     if not isinstance(policy, dict):
@@ -358,18 +417,11 @@ async def create_transaction(body: TransactionIn, user: dict | None = Depends(_o
     # 3. Start the Temporal workflow, using the transaction id as the workflow id
     #    (one workflow per transaction). The reused app.state.temporal client
     #    dispatches to the main "invoice-tq" queue the worker polls.
-    # Start the GENERIC interpreter with the full PDD (nodes/edges). The interpreter
-    # derives cfg/roles from it and walks the graph — invoice is just one PDD.
-    # Engine switch. Default = the LangGraph orchestrator (started BY NAME so the
-    # API never has to import langgraph). Set ORCHESTRATOR=temporal to fall back
-    # to the old interpreter. Both use the SAME signals, so task completion,
-    # finance votes, and tracking work identically either way.
-    if os.getenv("ORCHESTRATOR", "langgraph").lower() == "temporal":
-        await app.state.temporal.start_workflow(
-            ProcessInterpreterWorkflow.run, args=[txn_id, pdd], id=txn_id, task_queue="invoice-tq")
-    else:
-        await app.state.temporal.start_workflow(
-            "GraphOrchestratorWorkflow", args=[txn_id, pdd], id=txn_id, task_queue="invoice-tq")
+    # LangGraph is THE engine: GraphOrchestratorWorkflow turns this PDD into a
+    # LangGraph graph and walks it, pausing at human steps while Temporal holds
+    # the durable wait. Started BY NAME so the API needn't import langgraph.
+    await app.state.temporal.start_workflow(
+        "GraphOrchestratorWorkflow", args=[txn_id, pdd], id=txn_id, task_queue="invoice-tq")
 
     # 4. Hand the caller the id they use to track/act on this run.
     return {"transaction_id": txn_id}
@@ -629,15 +681,21 @@ async def list_tasks(
     # (CAST(:role AS text) IS NULL OR assigned_role = :role) makes `role` optional
     # in one query; the CAST avoids Postgres "could not determine parameter type"
     # when role is NULL.
+    # PROCESS SCOPING: a person only sees tasks from workflows they are assigned
+    # to in Admin. Both "invoice" and "leave" may use the role `manager`, so the
+    # role alone is not enough — manager1 (invoice) must not see leave tasks.
+    # Admins and authors are not restricted.
+    allowed = _allowed_processes(user)
     with engine.connect() as conn:
         rows = conn.execute(
             text(
-                "SELECT id, transaction_id, node_id, token, assigned_role, "
-                "       status, claimed_by, completion_policy, created_at "
-                "FROM task "
-                "WHERE status = :status "
-                "AND (CAST(:role AS text) IS NULL OR assigned_role = CAST(:role AS text)) "
-                "ORDER BY created_at"
+                "SELECT t.id, t.transaction_id, t.node_id, t.token, t.assigned_role, "
+                "       t.status, t.claimed_by, t.completion_policy, t.created_at "
+                "FROM task t "
+                "WHERE t.status = :status "
+                "AND (CAST(:role AS text) IS NULL OR t.assigned_role = CAST(:role AS text)) "
+                + _process_scope_sql(allowed, "t.transaction_id") +
+                " ORDER BY t.created_at"
             ),
             {"status": status, "role": role},
         ).mappings().all()
@@ -655,7 +713,10 @@ async def list_tasks(
                 "completion_policy": row["completion_policy"],
                 "created_at": str(row["created_at"]) if row["created_at"] is not None else None,
             }
-            if row["node_id"] == "finance":
+            # is_quorum drives the voting UI. Derived from the task's policy, so
+            # ANY step name can be a quorum step (panel, committee, board…).
+            item["is_quorum"] = _is_quorum_policy(row["completion_policy"])
+            if item["is_quorum"]:
                 try:
                     required, capacity, reject_short_circuits = _finance_policy_values(
                         row["completion_policy"]
@@ -757,14 +818,14 @@ async def claim_task(token: str, body: ClaimIn, user: dict = Depends(current_use
     # atomic claim below, which reports 409.)
     with engine.connect() as conn:
         task_row = conn.execute(
-            text("SELECT assigned_role, node_id FROM task WHERE token = :token"),
+            text("SELECT assigned_role, node_id, completion_policy FROM task WHERE token = :token"),
             {"token": token},
         ).mappings().first()
     assigned_role = task_row["assigned_role"] if task_row is not None else None
     if assigned_role is not None and assigned_role not in user["roles"]:
         raise HTTPException(status_code=403, detail=f"requires role '{assigned_role}'")
 
-    if task_row is not None and task_row["node_id"] == "finance":
+    if task_row is not None and _is_quorum_policy(task_row["completion_policy"]):
         with engine.begin() as conn:
             finance_task = conn.execute(
                 text(
@@ -884,8 +945,10 @@ async def _complete_finance_task(token: str, body: CompleteIn, user: dict) -> di
 
             task_row = conn.execute(
                 text(
+                    # Token is unique, so no node-name filter: a quorum step may be
+                    # called anything (panel, committee, board…).
                     "SELECT id, transaction_id, status, completion_policy FROM task "
-                    "WHERE token = :token AND node_id = 'finance' FOR UPDATE"
+                    "WHERE token = :token FOR UPDATE"
                 ),
                 {"token": token},
             ).mappings().first()
@@ -1039,7 +1102,8 @@ async def _complete_finance_task(token: str, body: CompleteIn, user: dict) -> di
 async def complete_task(token: str, body: CompleteIn, user: dict = Depends(current_user)):
     with engine.connect() as conn:
         row = conn.execute(
-            text("SELECT transaction_id, assigned_role, node_id FROM task WHERE token = :token"),
+            text("SELECT transaction_id, assigned_role, node_id, completion_policy "
+                 "FROM task WHERE token = :token"),
             {"token": token},
         ).mappings().first()
     if row is None:
@@ -1050,14 +1114,17 @@ async def complete_task(token: str, body: CompleteIn, user: dict = Depends(curre
     if assigned_role is not None and assigned_role not in user["roles"]:
         raise HTTPException(status_code=403, detail=f"requires role '{assigned_role}'")
 
-    if row["node_id"] == "finance":
+    # Multi-approver (quorum) tasks take the voting path. Decided by the task's
+    # policy so the step can be named anything, in any workflow.
+    is_quorum = _is_quorum_policy(row["completion_policy"])
+    if is_quorum:
         return await _complete_finance_task(token, body, user)
 
     evt = EventIn(
         transaction_id=str(row["transaction_id"]),
         task_token=token,
         idempotency_key=body.idempotency_key,
-        kind=body.kind,
+        kind="human",
         payload=body.payload,
     )
     return await ingest_event(evt)
@@ -1283,18 +1350,9 @@ async def get_definition(process_key: str):
     return pdd
 
 
-# WHY GET /v1/active-process: the "one workflow at a time" model. Returns the
-# single active (latest published) PDD so the Builder can LOAD it for editing —
-# the author edits this one and re-publishes. Returns null if none exists yet.
-@app.get("/v1/active-process")
-async def active_process():
-    with engine.connect() as conn:
-        pdd = conn.execute(text(
-            "SELECT dv.pdd FROM definition_version dv "
-            "WHERE dv.status = 'published' "
-            "ORDER BY dv.version DESC, dv.id DESC LIMIT 1"
-        )).scalar_one_or_none()
-    return pdd
+# (The old /v1/active-process endpoint was removed: the engine now runs MANY
+# workflows side by side. The Builder lists them via GET /v1/definitions and
+# loads one with GET /v1/definitions/{process_key}.)
 
 
 # ===========================================================================
@@ -1355,8 +1413,27 @@ async def admin_list_users(user: dict = Depends(require_role("ops_admin"))):
             roles = [r["name"] for r in rm if isinstance(r, dict) and r.get("name")]
         except Exception:
             pass
-        out.append({"username": u.get("username"), "email": u.get("email"), "roles": roles})
+        out.append({"username": u.get("username"), "email": u.get("email"), "roles": roles,
+                    "processes": _user_processes(u.get("username") or "") or []})
     return out
+
+
+def _set_user_processes(username: str, processes: list | None) -> None:
+    """Replace this person's workflow assignments (admin-controlled)."""
+    if processes is None:
+        return
+    keys = [str(p).strip() for p in processes if str(p).strip()]
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM user_process WHERE username = :u"), {"u": username})
+            for key in dict.fromkeys(keys):      # de-duplicate, keep order
+                conn.execute(
+                    text("INSERT INTO user_process (username, process_key) VALUES (:u, :p)"),
+                    {"u": username, "p": key})
+    except Exception as exc:
+        # Never fail user creation because assignments could not be stored (e.g.
+        # the migration has not run yet) — the account itself is still valid.
+        print(f"could not save workflow assignments for {username!r}: {exc}")
 
 
 CORE_ROLES = {"ops_admin", "process_author"}
@@ -1398,6 +1475,7 @@ class UserUpdate(BaseModel):
     password: str | None = None
     roles: list[str] | None = None
     new_username: str | None = None
+    processes: list[str] | None = None   # which workflows this person takes part in
 
 
 @app.put("/v1/admin/users/{username}")
@@ -1437,7 +1515,14 @@ async def admin_update_user(username: str, body: UserUpdate, user: dict = Depend
         if to_add:
             requests.post(f"{kc}/admin/realms/{realm}/users/{uid}/role-mappings/realm",
                           headers=h, json=to_add, timeout=10)
-    return {"username": body.new_username or username, "status": "updated"}
+    # Workflow assignments follow a rename so the person keeps their inbox.
+    final_username = body.new_username or username
+    if body.new_username and body.new_username != username:
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE user_process SET username = :new WHERE username = :old"),
+                         {"new": body.new_username, "old": username})
+    _set_user_processes(final_username, body.processes)
+    return {"username": final_username, "status": "updated"}
 
 
 class UserIn(BaseModel):
@@ -1445,6 +1530,7 @@ class UserIn(BaseModel):
     email: str | None = None
     password: str = "12345"
     roles: list[str] = []
+    processes: list[str] = []            # which workflows this person takes part in
 
 
 @app.post("/v1/admin/users")
@@ -1469,7 +1555,9 @@ async def admin_create_user(body: UserIn, user: dict = Depends(require_role("ops
             assign.append({"id": rr.json()["id"], "name": role})
     if assign:
         requests.post(f"{kc}/admin/realms/{realm}/users/{uid}/role-mappings/realm", headers=h, json=assign, timeout=10)
-    return {"username": body.username, "roles_assigned": [a["name"] for a in assign]}
+    _set_user_processes(body.username, body.processes)
+    return {"username": body.username, "roles_assigned": [a["name"] for a in assign],
+            "processes": body.processes}
 
 
 # ===========================================================================

@@ -26,17 +26,20 @@ function RolePicker({ roles, selected, onToggle }) {
 
 export function AdminPanel() {
   const [roles, setRoles] = useState([])
+  const [processes, setProcesses] = useState([])
   const [users, setUsers] = useState([])
   const [newRole, setNewRole] = useState('')
-  const [nu, setNu] = useState({ username: '', email: '', password: '12345', roles: [] })
+  const [nu, setNu] = useState({ username: '', email: '', password: '12345', roles: [], processes: [] })
   const [editing, setEditing] = useState(null) // username being edited
-  const [edit, setEdit] = useState({ email: '', password: '', roles: [], new_username: '' })
+  const [edit, setEdit] = useState({ email: '', password: '', roles: [], processes: [], new_username: '' })
   const [feedback, setFeedback] = useState(null)
   const [busy, setBusy] = useState(false)
 
   async function load() {
     try {
-      const [r, u] = await Promise.all([get('/v1/admin/roles'), get('/v1/admin/users')])
+      const [r, u, d] = await Promise.all([get('/v1/admin/roles'), get('/v1/admin/users'),
+        get('/v1/definitions').catch(() => [])])
+      setProcesses((d || []).map((x) => x.process_key).filter(Boolean))
       setRoles(r || [])
       setUsers(u || [])
     } catch (e) {
@@ -78,21 +81,24 @@ export function AdminPanel() {
         email: nu.email.trim() || null,
         password: nu.password || '12345',
         roles: nu.roles,
+        processes: nu.processes,
       })
-      setNu({ username: '', email: '', password: '12345', roles: [] })
+      setNu({ username: '', email: '', password: '12345', roles: [], processes: [] })
     }, `User '${nu.username.trim()}' saved.`)
   }
   const deleteUser = (username) => run(() => del(`/v1/admin/users/${encodeURIComponent(username)}`), `User '${username}' deleted.`)
 
   function startEdit(u) {
     setEditing(u.username)
-    setEdit({ email: u.email || '', password: '', roles: u.roles || [], new_username: u.username })
+    setEdit({ email: u.email || '', password: '', roles: u.roles || [],
+      processes: u.processes || [], new_username: u.username })
   }
   const saveEdit = (username) => run(async () => {
     await put(`/v1/admin/users/${encodeURIComponent(username)}`, {
       email: edit.email || null,
       password: edit.password || null,
       roles: edit.roles,
+      processes: edit.processes,
       new_username: edit.new_username && edit.new_username !== username ? edit.new_username : null,
     })
     setEditing(null)
@@ -147,6 +153,9 @@ export function AdminPanel() {
               <input value={nu.password} onChange={(e) => setNu({ ...nu, password: e.target.value })} /></label>
             <div className="field"><span>Roles</span>
               <RolePicker roles={roles} selected={nu.roles} onToggle={(r) => toggle(nu.roles, (v) => setNu({ ...nu, roles: v }), r)} /></div>
+            <div className="config-field"><span>Workflows this person works on</span>
+              <RolePicker roles={processes} selected={nu.processes} onToggle={(p) => toggle(nu.processes, (v) => setNu({ ...nu, processes: v }), p)} />
+              <span className="muted" style={{ fontSize: '0.75rem' }}>Tick none and they see no tasks. A person can be in several workflows.</span></div>
             <button className="primary-button" type="submit" disabled={busy}>Add user</button>
           </form>
         </section>
@@ -158,7 +167,7 @@ export function AdminPanel() {
         <div className="table-scroll">
           <table className="admin-table">
             <thead>
-              <tr><th>Username</th><th>Email</th><th>Roles</th><th></th></tr>
+              <tr><th>Username</th><th>Email</th><th>Roles</th><th>Workflows</th><th></th></tr>
             </thead>
             <tbody>
               {users.map((u) => (
@@ -166,8 +175,10 @@ export function AdminPanel() {
                   <tr key={u.username} className="editing-row">
                     <td><input value={edit.new_username} onChange={(e) => setEdit({ ...edit, new_username: e.target.value })} /></td>
                     <td><input value={edit.email} onChange={(e) => setEdit({ ...edit, email: e.target.value })} /></td>
-                    <td>
+                    <td colSpan={2}>
                       <RolePicker roles={roles} selected={edit.roles} onToggle={(r) => toggle(edit.roles, (v) => setEdit({ ...edit, roles: v }), r)} />
+                      <div className="mini-label" style={{ marginTop: 8 }}>Workflows</div>
+                      <RolePicker roles={processes} selected={edit.processes} onToggle={(p) => toggle(edit.processes, (v) => setEdit({ ...edit, processes: v }), p)} />
                       <input className="pw-input" placeholder="new password (optional)" value={edit.password} onChange={(e) => setEdit({ ...edit, password: e.target.value })} />
                     </td>
                     <td className="row-actions">
@@ -180,6 +191,7 @@ export function AdminPanel() {
                     <td>{u.username}</td>
                     <td>{u.email || '—'}</td>
                     <td>{(u.roles || []).join(', ') || '—'}</td>
+                    <td>{(u.processes || []).join(', ') || <span className="muted">none — sees no tasks</span>}</td>
                     <td className="row-actions">
                       <button className="secondary-button" type="button" onClick={() => startEdit(u)}>Edit</button>
                       {u.username !== 'admin1' && (
