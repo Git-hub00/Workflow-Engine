@@ -60,6 +60,8 @@ jobs:
             cat > services/api/.env <<'ENVEOF'
             GMAIL_ADDRESS=${{ vars.GMAIL_ADDRESS }}
             GMAIL_APP_PASSWORD=${{ secrets.GMAIL_APP_PASSWORD }}
+            MAILBOX_LEAVE_ADDRESS=${{ vars.MAILBOX_LEAVE_ADDRESS }}
+            MAILBOX_LEAVE_APP_PASSWORD=${{ secrets.MAILBOX_LEAVE_APP_PASSWORD }}
             NOTIFY_TO=${{ vars.NOTIFY_TO }}
             # Per-process mailboxes (optional). If a value is empty, the process
             # falls back to the default GMAIL_* mailbox above. Add more by copying
