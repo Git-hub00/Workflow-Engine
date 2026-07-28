@@ -16,6 +16,7 @@
 from datetime import timedelta
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
@@ -25,6 +26,14 @@ with workflow.unsafe.imports_passed_through():
 
 _T_SHORT = timedelta(seconds=30)
 _T_ADVANCE = timedelta(minutes=5)   # a single graph hop (may run extract/decision)
+# Sending a notification can be SLOW: the AI writes the wording and SMTP may sit
+# waiting on a bad recipient domain. With the old 30s limit the activity timed
+# out, Temporal retried it forever, the same email went out again and again, and
+# the workflow NEVER got past the notify — so an approved task never moved on.
+_T_NOTIFY = timedelta(minutes=3)
+# And if a notification genuinely cannot be sent, give up after a few tries
+# instead of blocking the whole process. The audit event is already written.
+_NOTIFY_RETRY = RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=5))
 
 
 @workflow.defn
@@ -108,7 +117,7 @@ class GraphOrchestratorWorkflow:
         await workflow.execute_activity(
             notify, args=[txn_id, "email", message, recipient, self._mailbox,
                           self._email_context(node, data, missing)],
-            start_to_close_timeout=_T_SHORT)
+            start_to_close_timeout=_T_NOTIFY, retry_policy=_NOTIFY_RETRY)
 
         sla_hours = node.get("sla_hours") or 48
         on_timeout = node.get("on_timeout") or "remind"
@@ -120,7 +129,7 @@ class GraphOrchestratorWorkflow:
                 return {"decision": "reject", "auto": True}
             await workflow.execute_activity(
                 notify, args=[txn_id, "email", "Reminder / escalation", recipient, self._mailbox],
-                start_to_close_timeout=_T_SHORT)
+                start_to_close_timeout=_T_NOTIFY, retry_policy=_NOTIFY_RETRY)
             await workflow.wait_condition(lambda: self._signal is not None)
         return self._signal
 
@@ -136,7 +145,7 @@ class GraphOrchestratorWorkflow:
         await workflow.execute_activity(
             notify, args=[txn_id, "email", message, recipient, self._mailbox,
                           self._email_context(node, data, missing)],
-            start_to_close_timeout=_T_SHORT)
+            start_to_close_timeout=_T_NOTIFY, retry_policy=_NOTIFY_RETRY)
 
         def decided():
             if self._finance_result is not None:
@@ -191,4 +200,4 @@ class GraphOrchestratorWorkflow:
                    "outcome": outcome, "data": data or {}}
         await workflow.execute_activity(
             notify, args=[txn_id, "email", message, recipient, self._mailbox, context],
-            start_to_close_timeout=_T_SHORT)
+            start_to_close_timeout=_T_NOTIFY, retry_policy=_NOTIFY_RETRY)

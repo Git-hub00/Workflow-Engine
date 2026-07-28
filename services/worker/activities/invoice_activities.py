@@ -573,14 +573,18 @@ def _compose_email(context: dict, fallback: str) -> tuple[str, str]:
         body = (f"Hello,\n\nA request in '{process}' is waiting for your approval "
                 f"at the '{step}' step.")
 
-    # 2. Optional LLM rewrite of just the greeting/explanation.
+    # 2. Optional LLM rewrite of just the greeting/explanation. Kept on a SHORT
+    #    leash: a slow model must never hold up the workflow (set EMAIL_AI=0 to
+    #    skip it entirely and always use the plain wording above).
     try:
         import os
+        if os.getenv("EMAIL_AI", "1").strip().lower() in ("0", "false", "no"):
+            raise RuntimeError("EMAIL_AI disabled")
         from langchain_openai import ChatOpenAI
         llm = ChatOpenAI(
             base_url=os.getenv("LLM_BASE_URL", "http://localhost:11434/v1"),
             api_key="ollama", model=os.getenv("LLM_MODEL", "llama3.2:1b"),
-            temperature=0, timeout=float(os.getenv("LLM_EMAIL_TIMEOUT", "25")),
+            temperature=0, timeout=float(os.getenv("LLM_EMAIL_TIMEOUT", "20")), max_retries=0,
         )
         prompt = (
             f"Write a short, polite business email body (3 sentences max, no subject "

@@ -50,6 +50,17 @@ function formatMoney(value) {
   return Number.isNaN(number) ? String(value) : `$${number.toLocaleString()}`
 }
 
+// Show whatever fields THIS process carries (invoice: vendor/amount;
+// leave: employee/days; ...). Nothing is hardcoded to one workflow.
+function summarize(data, max = 3) {
+  if (!data || typeof data !== 'object') return '—'
+  const parts = Object.entries(data)
+    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .slice(0, max)
+    .map(([k, v]) => `${k}: ${typeof v === 'number' ? v.toLocaleString() : String(v)}`)
+  return parts.length ? parts.join(' · ') : '—'
+}
+
 function pretty(value) {
   if (typeof value === 'string') return value
   return JSON.stringify(value, null, 2)
@@ -661,6 +672,8 @@ function TaskInbox({ roles, username }) {
 const PAGE_SIZE = 10
 
 function Monitor() {
+  const [processes, setProcesses] = useState([])
+  const [proc, setProc] = useState('')            // '' = all workflows
   const [transactions, setTransactions] = useState([])
   const [stats, setStats] = useState(null)
   // KPI filter ('total' = all) + 1-based page within that filter.
@@ -674,6 +687,12 @@ function Monitor() {
   const [historyError, setHistoryError] = useState('')
 
   useEffect(() => {
+    get('/v1/definitions')
+      .then((rows) => setProcesses((rows || []).map((r) => r.process_key).filter(Boolean)))
+      .catch(() => setProcesses([]))
+  }, [])
+
+  useEffect(() => {
     let active = true
     let polling = false
 
@@ -683,9 +702,10 @@ function Monitor() {
 
       try {
         const statusParam = filter === 'total' ? '' : `&status=${encodeURIComponent(filter)}`
+        const procParam = proc ? `&process_key=${encodeURIComponent(proc)}` : ''
         const [rows, counts] = await Promise.all([
-          get(`/v1/transactions?limit=${PAGE_SIZE}&offset=${(page - 1) * PAGE_SIZE}${statusParam}`),
-          get('/v1/transactions/stats'),
+          get(`/v1/transactions?limit=${PAGE_SIZE}&offset=${(page - 1) * PAGE_SIZE}${statusParam}${procParam}`),
+          get(`/v1/transactions/stats${proc ? `?process_key=${encodeURIComponent(proc)}` : ''}`),
         ])
         if (active) {
           setTransactions(rows)
@@ -709,7 +729,7 @@ function Monitor() {
       active = false
       window.clearInterval(timer)
     }
-  }, [filter, page])
+  }, [filter, page, proc])
 
   const displayTransactions = useMemo(
     () => transactions.map((transaction) => ({
@@ -762,6 +782,20 @@ function Monitor() {
         <span className="live-indicator"><span /> Live</span>
       </div>
 
+      {/* One monitor per workflow — generic, built from whatever exists. */}
+      {processes.length > 0 && (
+        <div className="process-strip" role="tablist" aria-label="Workflows">
+          <button type="button" role="tab" aria-selected={proc === ''}
+            className={`process-chip ${proc === '' ? 'active' : ''}`}
+            onClick={() => { setProc(''); setPage(1); setSelected(null) }}>All workflows</button>
+          {processes.map((key) => (
+            <button type="button" key={key} role="tab" aria-selected={proc === key}
+              className={`process-chip ${proc === key ? 'active' : ''}`}
+              onClick={() => { setProc(key); setPage(1); setSelected(null) }}>{key}</button>
+          ))}
+        </div>
+      )}
+
       {error && <Feedback feedback={{ type: 'error', message: error }} />}
       {loading ? (
         <LoadingPanel label="Loading recent transactions…" />
@@ -791,8 +825,8 @@ function Monitor() {
                     <th>Status</th>
                     <th>Created</th>
                     <th>Closed</th>
-                    <th>Vendor</th>
-                    <th>Amount</th>
+                    <th>Process</th>
+                    <th>Details</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -806,8 +840,8 @@ function Monitor() {
                       <td><span className={statusPillClass(transaction.status)}>{transaction.status}</span></td>
                       <td>{formatDate(transaction.created_at)}</td>
                       <td>{formatDate(transaction.closed_at)}</td>
-                      <td>{transaction.data_snapshot?.vendor || '—'}</td>
-                      <td>{formatMoney(transaction.data_snapshot?.amount)}</td>
+                      <td>{transaction.process_key || '—'}</td>
+                      <td>{summarize(transaction.data_snapshot)}</td>
                     </tr>
                   ))}
                 </tbody>

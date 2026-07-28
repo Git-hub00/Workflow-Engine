@@ -1570,10 +1570,19 @@ async def admin_create_user(body: UserIn, user: dict = Depends(require_role("ops
 # WHY GET /v1/transactions/stats: per-status counts across ALL transactions so
 # the Monitor's KPI boxes reflect the full dataset, not just the current page.
 @app.get("/v1/transactions/stats")
-async def transaction_stats():
+async def transaction_stats(process_key: str | None = None):
+    # Counts for ONE workflow when process_key is given, else across all.
+    where = ""
+    params: dict = {}
+    if process_key:
+        where = (' WHERE tr.definition_version_id IN (SELECT dv.id FROM definition_version dv '
+                 "JOIN process_definition pd ON pd.id = dv.definition_id "
+                 "WHERE pd.process_key = :pk) ")
+        params["pk"] = process_key
     with engine.connect() as conn:
         rows = conn.execute(
-            text('SELECT status, count(*) AS n FROM "transaction" GROUP BY status')
+            text(f'SELECT tr.status AS status, count(*) AS n FROM "transaction" tr{where} '
+                 "GROUP BY tr.status"), params
         ).mappings().all()
     counts = {r["status"]: r["n"] for r in rows}
     return {
@@ -1589,7 +1598,10 @@ async def transaction_stats():
 # for existing callers (vendor inbox, email adapter) while enabling the Monitor's
 # pagination + KPI filtering.
 @app.get("/v1/transactions")
-async def list_transactions(status: str | None = None, limit: int = 100, offset: int = 0):
+async def list_transactions(status: str | None = None, limit: int = 100, offset: int = 0,
+                            process_key: str | None = None):
+    # process_key gives each workflow its OWN monitor view (generic — the value
+    # comes from whatever workflows exist, nothing is hardcoded).
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
     with engine.connect() as conn:
@@ -1605,9 +1617,10 @@ async def list_transactions(status: str | None = None, limit: int = 100, offset:
                 "LEFT JOIN definition_version dv ON dv.id = tr.definition_version_id "
                 "LEFT JOIN process_definition pd ON pd.id = dv.definition_id "
                 "WHERE (CAST(:status AS text) IS NULL OR tr.status = CAST(:status AS text)) "
+                "AND (CAST(:pk AS text) IS NULL OR pd.process_key = CAST(:pk AS text)) "
                 "ORDER BY tr.created_at DESC, tr.id DESC LIMIT :limit OFFSET :offset"
             ),
-            {"status": status, "limit": limit, "offset": offset},
+            {"status": status, "pk": process_key, "limit": limit, "offset": offset},
         ).mappings().all()
     # Stringify uuid/timestamp so the payload is JSON-serializable; data_snapshot
     # is jsonb and already deserializes to a dict.
