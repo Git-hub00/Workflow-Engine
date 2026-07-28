@@ -13,6 +13,7 @@
 # The human signals are the SAME names the API already sends (human_decision,
 # finance_vote), so the task-inbox / complete-task endpoint works unchanged.
 
+import asyncio
 from datetime import timedelta
 
 from temporalio import workflow
@@ -121,14 +122,28 @@ class GraphOrchestratorWorkflow:
 
         sla_hours = node.get("sla_hours") or 48
         on_timeout = node.get("on_timeout") or "remind"
-        if not await workflow.wait_condition(lambda: self._signal is not None,
-                                             timeout=timedelta(hours=sla_hours)):
+        # NOTE: wait_condition returns None and RAISES asyncio.TimeoutError when the
+        # deadline passes. Testing its return value ("if not await ...") was always
+        # true, so the deadline branch fired the moment a human answered — sending a
+        # bogus "Reminder / escalation" every time, and (with auto_approve /
+        # auto_reject configured) even overriding the person's real decision.
+        timed_out = False
+        try:
+            await workflow.wait_condition(lambda: self._signal is not None,
+                                          timeout=timedelta(hours=sla_hours))
+        except asyncio.TimeoutError:
+            timed_out = True
+
+        if timed_out:
             if on_timeout == "auto_approve":
                 return {"decision": "approve", "auto": True}
             if on_timeout == "auto_reject":
                 return {"decision": "reject", "auto": True}
+            # Nudge, then keep waiting for a real person (no deadline this time).
             await workflow.execute_activity(
-                notify, args=[txn_id, "email", "Reminder / escalation", recipient, self._mailbox],
+                notify, args=[txn_id, "email", f"Reminder: {node.get('id')} is still waiting",
+                              recipient, self._mailbox,
+                              {**self._email_context(node, data, missing), "kind": "task"}],
                 start_to_close_timeout=_T_NOTIFY, retry_policy=_NOTIFY_RETRY)
             await workflow.wait_condition(lambda: self._signal is not None)
         return self._signal

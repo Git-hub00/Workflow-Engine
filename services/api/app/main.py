@@ -1217,6 +1217,16 @@ async def put_config(process_key: str, body: ConfigIn, user: dict = Depends(requ
 # ===========================================================================
 
 
+_BUILTIN_ROLE_PREFIXES = ("default-roles",)
+_BUILTIN_ROLES = {"offline_access", "uma_authorization", "admin", "create-realm"}
+
+
+def _is_builtin_role(name: str) -> bool:
+    """Keycloak's own plumbing roles — never business roles."""
+    n = str(name or "")
+    return n in _BUILTIN_ROLES or n.startswith(_BUILTIN_ROLE_PREFIXES)
+
+
 def _keycloak_realm_roles() -> set | None:
     # Names of all realm roles in Keycloak; None if unreachable (publish then warns
     # instead of hard-failing on a transient Keycloak outage).
@@ -1260,7 +1270,9 @@ def _check_pdd(pdd: dict) -> tuple[list, list]:
 # Builder. Creating/deleting roles stays admin-only under /v1/admin/roles.
 @app.get("/v1/roles")
 async def list_roles():
-    return sorted(_keycloak_realm_roles() or [])
+    # Hide Keycloak's own built-in roles — they are not business roles and must
+    # not be offered when assigning people to workflow steps.
+    return sorted(r for r in (_keycloak_realm_roles() or []) if not _is_builtin_role(r))
 
 
 class DefinitionIn(BaseModel):
@@ -1384,7 +1396,9 @@ def _kc_admin():
 async def admin_list_roles(user: dict = Depends(require_role("ops_admin"))):
     kc, realm, h = _kc_admin()
     roles = requests.get(f"{kc}/admin/realms/{realm}/roles", headers=h, timeout=10).json()
-    return sorted(r["name"] for r in roles if isinstance(r, dict) and r.get("name"))
+    # Only real business roles — Keycloak's built-ins are noise in the Admin UI.
+    return sorted(r["name"] for r in roles
+                  if isinstance(r, dict) and r.get("name") and not _is_builtin_role(r["name"]))
 
 
 class RoleIn(BaseModel):
@@ -1540,12 +1554,36 @@ async def admin_create_user(body: UserIn, user: dict = Depends(require_role("ops
     if body.email:
         payload["email"] = body.email
         payload["emailVerified"] = True
-    requests.post(f"{kc}/admin/realms/{realm}/users", headers=h, json=payload, timeout=10)  # 409 if exists: fine
-    found = requests.get(f"{kc}/admin/realms/{realm}/users", headers=h,
-                         params={"username": body.username, "exact": "true"}, timeout=10).json()
-    if not found:
-        raise HTTPException(status_code=502, detail="user create/lookup failed")
-    uid = found[0]["id"]
+    created = requests.post(f"{kc}/admin/realms/{realm}/users", headers=h, json=payload, timeout=10)
+
+    # Prefer the id Keycloak returns in the Location header (most reliable).
+    uid = None
+    if created.status_code in (200, 201):
+        location = created.headers.get("Location") or ""
+        if "/" in location:
+            uid = location.rstrip("/").rsplit("/", 1)[-1]
+    if not uid:
+        uid = _kc_user_id(kc, realm, h, body.username)
+    if not uid:
+        # Surface the ACTUAL reason instead of a blank "create/lookup failed".
+        # The usual causes are a duplicate username, or a duplicate EMAIL when the
+        # realm has duplicateEmailsAllowed=false.
+        try:
+            reason = created.json()
+            reason = reason.get("errorMessage") or reason.get("error") or str(reason)
+        except Exception:
+            reason = (created.text or "").strip()[:200]
+        hint = ""
+        low = str(reason).lower()
+        if "email" in low and "exist" in low:
+            hint = (" — another user already has this email. Use a different email, "
+                    "or allow duplicate emails in the Keycloak realm settings.")
+        elif "user exists" in low or created.status_code == 409:
+            hint = " — that username already exists."
+        raise HTTPException(
+            status_code=400 if created.status_code in (400, 409) else 502,
+            detail=f"Could not create user '{body.username}': "
+                   f"Keycloak said {created.status_code} {reason or 'no detail'}{hint}")
     requests.put(f"{kc}/admin/realms/{realm}/users/{uid}/reset-password", headers=h,
                  json={"type": "password", "value": body.password, "temporary": False}, timeout=10)
     assign = []
