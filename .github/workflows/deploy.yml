@@ -62,6 +62,8 @@ jobs:
             GMAIL_APP_PASSWORD=${{ secrets.GMAIL_APP_PASSWORD }}
             MAILBOX_LEAVE_ADDRESS=${{ vars.MAILBOX_LEAVE_ADDRESS }}
             MAILBOX_LEAVE_APP_PASSWORD=${{ secrets.MAILBOX_LEAVE_APP_PASSWORD }}
+            MAILBOX_REFUND_ADDRESS=${{ vars.MAILBOX_REFUND_ADDRESS }}
+            MAILBOX_REFUND_APP_PASSWORD=${{ secrets.MAILBOX_REFUND_APP_PASSWORD }}
             NOTIFY_TO=${{ vars.NOTIFY_TO }}
             # Per-process mailboxes (optional). If a value is empty, the process
             # falls back to the default GMAIL_* mailbox above. Add more by copying
