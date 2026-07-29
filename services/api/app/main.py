@@ -1367,6 +1367,24 @@ async def get_definition(process_key: str):
 # loads one with GET /v1/definitions/{process_key}.)
 
 
+# WHY GET /v1/my-processes: the workflows the SIGNED-IN person may look at —
+# the ones an admin assigned to them, or ALL of them for an admin/author.
+# Deliberately a NEW endpoint: /v1/definitions must stay unfiltered because the
+# email adapter uses it to find which workflow owns a mailbox.
+@app.get("/v1/my-processes")
+async def my_processes(user: dict = Depends(current_user)):
+    with engine.connect() as conn:
+        all_keys = conn.execute(text(
+            "SELECT DISTINCT pd.process_key FROM process_definition pd "
+            "JOIN definition_version dv ON dv.definition_id = pd.id "
+            "WHERE dv.status = 'published' ORDER BY pd.process_key"
+        )).scalars().all()
+    allowed = _allowed_processes(user)          # None = unrestricted
+    if allowed is None:
+        return {"processes": list(all_keys), "unrestricted": True}
+    return {"processes": [k for k in all_keys if k in set(allowed)], "unrestricted": False}
+
+
 # ===========================================================================
 # Admin identity (Ops/Admin, Section 5.8): manage Keycloak roles + users in-app,
 # gated to 'ops_admin'. Per the spec, process authors REFERENCE roles while an
@@ -1608,15 +1626,21 @@ async def admin_create_user(body: UserIn, user: dict = Depends(require_role("ops
 # WHY GET /v1/transactions/stats: per-status counts across ALL transactions so
 # the Monitor's KPI boxes reflect the full dataset, not just the current page.
 @app.get("/v1/transactions/stats")
-async def transaction_stats(process_key: str | None = None):
-    # Counts for ONE workflow when process_key is given, else across all.
-    where = ""
+async def transaction_stats(process_key: str | None = None,
+                            user: dict | None = Depends(_optional_user)):
+    # Counts for ONE workflow when process_key is given, else across all the
+    # workflows this person is allowed to see.
+    clauses = []
     params: dict = {}
     if process_key:
-        where = (' WHERE tr.definition_version_id IN (SELECT dv.id FROM definition_version dv '
-                 "JOIN process_definition pd ON pd.id = dv.definition_id "
-                 "WHERE pd.process_key = :pk) ")
+        clauses.append('tr.definition_version_id IN (SELECT dv.id FROM definition_version dv '
+                       "JOIN process_definition pd ON pd.id = dv.definition_id "
+                       "WHERE pd.process_key = :pk)")
         params["pk"] = process_key
+    scope = _process_scope_sql(_allowed_processes(user), "tr.id").strip()
+    if scope:
+        clauses.append(scope[4:] if scope.startswith("AND ") else scope)
+    where = (" WHERE " + " AND ".join(clauses) + " ") if clauses else ""
     with engine.connect() as conn:
         rows = conn.execute(
             text(f'SELECT tr.status AS status, count(*) AS n FROM "transaction" tr{where} '
@@ -1637,11 +1661,16 @@ async def transaction_stats(process_key: str | None = None):
 # pagination + KPI filtering.
 @app.get("/v1/transactions")
 async def list_transactions(status: str | None = None, limit: int = 100, offset: int = 0,
-                            process_key: str | None = None):
+                            process_key: str | None = None,
+                            user: dict | None = Depends(_optional_user)):
     # process_key gives each workflow its OWN monitor view (generic — the value
-    # comes from whatever workflows exist, nothing is hardcoded).
+    # comes from whatever workflows exist, nothing is hardcoded). Rows are ALSO
+    # limited to the workflows this person is assigned to, so a business user can
+    # no longer see another team's runs. Admins/authors see everything, and an
+    # unauthenticated caller is left unrestricted for backward compatibility.
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
+    scope_sql = _process_scope_sql(_allowed_processes(user), "tr.id")
     with engine.connect() as conn:
         rows = conn.execute(
             text(
@@ -1656,6 +1685,7 @@ async def list_transactions(status: str | None = None, limit: int = 100, offset:
                 "LEFT JOIN process_definition pd ON pd.id = dv.definition_id "
                 "WHERE (CAST(:status AS text) IS NULL OR tr.status = CAST(:status AS text)) "
                 "AND (CAST(:pk AS text) IS NULL OR pd.process_key = CAST(:pk AS text)) "
+                + scope_sql +
                 "ORDER BY tr.created_at DESC, tr.id DESC LIMIT :limit OFFSET :offset"
             ),
             {"status": status, "pk": process_key, "limit": limit, "offset": offset},

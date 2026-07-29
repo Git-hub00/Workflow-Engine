@@ -1505,6 +1505,78 @@ td.mono {
 .flow-zoom button:hover { background: #f1f5f9; }
 .flow-canvas { border: 1px solid var(--line, #e2e8f0); border-radius: 12px; background: #fbfcfe; }
 
+/* ---- Sticky top: header + tabs stay put while the page scrolls ----------
+   Header and tab row live in ONE sticky wrapper, so there is no fragile
+   height arithmetic between two separately-stuck elements. --top-h is
+   measured at runtime and used by anything that must sit below them. */
+.app-top {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  background: var(--panel, #fff);
+}
+/* The Builder's preview column sticks BELOW the sticky header + tabs. */
+.builder-preview { top: calc(var(--top-h, 126px) + 14px) !important; }
+
+/* ---- Transaction popup: blurred backdrop + ~85% panel with tabs -------- */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  background: rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  padding: 20px;
+}
+.modal-panel {
+  width: 85vw;
+  max-width: 1250px;
+  height: 85vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel, #fff);
+  border: 1px solid var(--line, #e2e8f0);
+  border-radius: 16px;
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.28);
+  padding: 22px 26px;
+  overflow: hidden;
+}
+.modal-panel .audit-heading { flex: 0 0 auto; }
+.modal-panel .monitor-detail-grid { flex: 0 0 auto; }
+
+.modal-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 4px;
+  margin: 14px 0 4px;
+  border-bottom: 1px solid var(--line, #e2e8f0);
+}
+.modal-tabs button {
+  padding: 10px 20px;
+  border: 0;
+  background: transparent;
+  color: var(--muted, #64748b);
+  font-weight: 700;
+  font-size: 0.92rem;
+  cursor: pointer;
+  border-bottom: 3px solid transparent;
+}
+.modal-tabs button:hover { color: var(--ink, #1e293b); }
+.modal-tabs button.active {
+  color: var(--primary, #4f6ef7);
+  border-bottom-color: var(--primary, #4f6ef7);
+}
+
+/* Only the tab CONTENT scrolls — the header and tabs stay visible. */
+.modal-body { flex: 1 1 auto; overflow-y: auto; padding-top: 14px; min-height: 0; }
+.flow-legend { font-size: 0.78rem; margin: 0 0 10px; }
+
+@media (max-width: 820px) {
+  .modal-panel { width: 96vw; height: 92vh; padding: 16px; }
+}
+
 /* ---- Workflow strip: New + one button per workflow, scrolls sideways --- */
 .process-strip {
   display: flex; align-items: center; gap: 8px; margin: 0 0 18px;

@@ -3,7 +3,7 @@
 // Generic, PDD-driven UI building blocks (P5, slice 1). These render from a
 // process definition instead of hardcoding invoice, so ANY published process can
 // be launched from the catalog. Reuses the existing App.css classes for styling.
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { get, post, upload } from './api'
 
 // data_schema is {fieldName: "string"|"number"} in the PDD. Turn it into the
@@ -135,30 +135,92 @@ function computeLayout(pdd) {
   }
 }
 
-// Pure diagram from a PDD object (used by the Builder's live preview). Renders a
-// hint until there are nodes to lay out.
-export function FlowDiagram({ pdd, height = 520 }) {
+// Pure diagram from a PDD object.
+//
+// Optional highlighting (used by the Monitor to show ONE transaction's journey):
+//   visited  Set/array of step ids the run actually passed through
+//   taken    Set/array of "from>to" edge keys the run actually followed
+//   current  the step the run is sitting at right now
+//   outcome  'approved' | 'rejected' -> tints the finished step green / red
+// Passing none of them keeps the plain design-time look (Builder preview).
+export function FlowDiagram({ pdd, height = 520, visited, taken, current, outcome }) {
   const layout = pdd && Array.isArray(pdd.nodes) && pdd.nodes.length ? computeLayout(pdd) : null
-  const [view, setView] = useState({ s: 1, x: 0, y: 0 })
+  const [view, setView] = useState(null)          // null until we auto-fit
   const drag = useRef(null)
+  const boxRef = useRef(null)
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v))
-  if (!layout) return <p className="muted">Add a start step (and connect steps) to see the diagram.</p>
 
-  const zoom = (f) => setView((v) => ({ ...v, s: clamp(v.s * f, 0.3, 2.5) }))
-  const onWheel = (e) => { e.preventDefault(); zoom(e.deltaY < 0 ? 1.1 : 0.9) }
-  const onDown = (e) => { drag.current = { x: e.clientX, y: e.clientY, ox: view.x, oy: view.y } }
+  const vSet = useMemo(() => new Set(visited || []), [visited])
+  const tSet = useMemo(() => new Set(taken || []), [taken])
+  const highlighting = Boolean(visited || current)
+
+  // Fit the whole graph on first paint (and when the graph changes) so nothing is
+  // ever cut off inside the box. Previously the default zoom could push the lower
+  // half out of a fixed-height box with no way back except Reset.
+  const fitScale = layout
+    ? clamp(Math.min(1, (height - 24) / layout.height), 0.25, 1)
+    : 1
+  useEffect(() => { setView({ s: fitScale, x: 0, y: 0 }) }, [fitScale, layout && layout.width, layout && layout.height])
+
+  // Wheel zoom must be a NON-PASSIVE listener, otherwise the browser ignores
+  // preventDefault() and scrolls the PAGE instead of zooming the graph (that was
+  // the "the whole page jumps / I had to reload" glitch).
+  useEffect(() => {
+    const el = boxRef.current
+    if (!el) return undefined
+    const onWheelNative = (e) => {
+      e.preventDefault()
+      setView((v) => ({ ...(v || { x: 0, y: 0 }), s: clamp((v ? v.s : 1) * (e.deltaY < 0 ? 1.1 : 0.9), 0.25, 2.5) }))
+    }
+    el.addEventListener('wheel', onWheelNative, { passive: false })
+    return () => el.removeEventListener('wheel', onWheelNative)
+  }, [])
+
+  if (!layout) return <p className="muted">Add a start step (and connect steps) to see the diagram.</p>
+  const v = view || { s: fitScale, x: 0, y: 0 }
+
+  // Keep the graph inside the box: panning is limited to the scaled size.
+  const limitX = Math.max(120, layout.width * v.s * 0.6)
+  const limitY = Math.max(120, layout.height * v.s * 0.6)
+  const zoom = (f) => setView((c) => ({ ...(c || v), s: clamp((c ? c.s : v.s) * f, 0.25, 2.5) }))
+  const onDown = (e) => { drag.current = { x: e.clientX, y: e.clientY, ox: v.x, oy: v.y } }
   const onMove = (e) => {
     if (!drag.current) return
-    setView((v) => ({ ...v, x: drag.current.ox + (e.clientX - drag.current.x), y: drag.current.oy + (e.clientY - drag.current.y) }))
+    setView((c) => ({
+      ...(c || v),
+      x: clamp(drag.current.ox + (e.clientX - drag.current.x), -limitX, limitX),
+      y: clamp(drag.current.oy + (e.clientY - drag.current.y), -limitY, limitY),
+    }))
   }
   const onUp = () => { drag.current = null }
 
+  // Colours for a highlighted run.
+  const END_FILL = { approved: '#dcfce7', rejected: '#fee2e2' }
+  const END_STROKE = { approved: '#16a34a', rejected: '#dc2626' }
+  const nodeFill = (n) => {
+    if (!highlighting) return NODE_FILL[n.type] || '#f1f5f9'
+    if (n.id === current && n.type === 'end') return END_FILL[outcome] || '#e0f2fe'
+    if (n.id === current) return '#e0f2fe'
+    if (vSet.has(n.id)) return NODE_FILL[n.type] || '#f1f5f9'
+    return '#f8fafc'                                  // untouched -> pale
+  }
+  const nodeStroke = (n) => {
+    if (!highlighting) return NODE_STROKE[n.type] || '#cbd5e1'
+    if (n.id === current && n.type === 'end') return END_STROKE[outcome] || '#0284c7'
+    if (n.id === current) return '#0284c7'
+    if (vSet.has(n.id)) return NODE_STROKE[n.type] || '#cbd5e1'
+    return '#e2e8f0'
+  }
+  const nodeOpacity = (n) => (highlighting && !vSet.has(n.id) && n.id !== current ? 0.45 : 1)
+  const edgeOn = (a, b) => !highlighting || tSet.has(`${a}>${b}`)
+
   return (
-    <div className="flow-canvas" style={{ height, position: 'relative', overflow: 'hidden' }}>
+    <div className="flow-canvas" ref={boxRef}
+         style={{ height, position: 'relative', overflow: 'hidden' }}>
       <div className="flow-zoom">
         <button type="button" onClick={() => zoom(1.2)} title="Zoom in">+</button>
         <button type="button" onClick={() => zoom(0.8)} title="Zoom out">-</button>
-        <button type="button" onClick={() => setView({ s: 1, x: 0, y: 0 })} title="Reset view">Reset</button>
+        <button type="button" onClick={() => setView({ s: fitScale, x: 0, y: 0 })} title="Fit the whole flow">Fit</button>
       </div>
       <svg
         width="100%"
@@ -167,8 +229,7 @@ export function FlowDiagram({ pdd, height = 520 }) {
         preserveAspectRatio="xMidYMid meet"
         role="img"
         aria-label="Process flow diagram"
-        style={{ cursor: drag.current ? 'grabbing' : 'grab', userSelect: 'none' }}
-        onWheel={onWheel}
+        style={{ cursor: 'grab', userSelect: 'none' }}
         onMouseDown={onDown}
         onMouseMove={onMove}
         onMouseUp={onUp}
@@ -178,8 +239,11 @@ export function FlowDiagram({ pdd, height = 520 }) {
           <marker id="bld-arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
             <polygon points="0 0, 9 3.5, 0 7" fill="#94a3b8" />
           </marker>
+          <marker id="bld-arrow-on" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto">
+            <polygon points="0 0, 10 4, 0 8" fill="#2563eb" />
+          </marker>
         </defs>
-        <g transform={`translate(${view.x} ${view.y}) scale(${view.s})`}>
+        <g transform={`translate(${v.x} ${v.y}) scale(${v.s})`}>
           {layout.links.map((link, idx) => {
             const a = layout.pos[link.from]
             const b = layout.pos[link.to]
@@ -203,11 +267,15 @@ export function FlowDiagram({ pdd, height = 520 }) {
               lx = mx; ly = (y1 + y2) / 2 - 5
             }
             const label = link.label && link.label.length > 18 ? `${link.label.slice(0, 17)}...` : link.label
+            const on = edgeOn(link.from, link.to)
             return (
-              <g key={`bld-e-${idx}`}>
-                <path d={d} fill="none" stroke="#94a3b8" strokeWidth="1.4" markerEnd="url(#bld-arrow)" />
+              <g key={`bld-e-${idx}`} opacity={on ? 1 : 0.3}>
+                <path d={d} fill="none" stroke={on && highlighting ? '#2563eb' : '#94a3b8'}
+                      strokeWidth={on && highlighting ? 2.6 : 1.4}
+                      markerEnd={on && highlighting ? 'url(#bld-arrow-on)' : 'url(#bld-arrow)'} />
                 {label && (
-                  <text x={lx} y={ly} textAnchor="middle" fontSize="10" fill="#475569"
+                  <text x={lx} y={ly} textAnchor="middle" fontSize="10"
+                        fill={on && highlighting ? '#1d4ed8' : '#475569'}
                         stroke="#ffffff" strokeWidth="3" paintOrder="stroke">{label}</text>
                 )}
               </g>
@@ -216,12 +284,24 @@ export function FlowDiagram({ pdd, height = 520 }) {
           {layout.nodes.map((n) => {
             const p = layout.pos[n.id]
             if (!p) return null
+            const isCurrent = n.id === current
             return (
-              <g key={n.id}>
+              <g key={n.id} opacity={nodeOpacity(n)}>
+                {isCurrent && (
+                  <rect x={p.x - 5} y={p.y - 5} width={layout.BW + 10} height={layout.BH + 10} rx="15"
+                        fill="none" stroke={nodeStroke(n)} strokeWidth="2.5" opacity="0.45" />
+                )}
                 <rect x={p.x} y={p.y} width={layout.BW} height={layout.BH} rx="12"
-                      fill={NODE_FILL[n.type] || '#f1f5f9'} stroke={NODE_STROKE[n.type] || '#cbd5e1'} strokeWidth="1.5" />
+                      fill={nodeFill(n)} stroke={nodeStroke(n)}
+                      strokeWidth={isCurrent ? 2.8 : 1.5} />
                 <text x={p.x + layout.BW / 2} y={p.y + 26} textAnchor="middle" fontSize="13" fontWeight="600" fill="#1e293b">{n.id}</text>
                 <text x={p.x + layout.BW / 2} y={p.y + 44} textAnchor="middle" fontSize="10" fill="#64748b">{n.type}</text>
+                {isCurrent && (
+                  <text x={p.x + layout.BW / 2} y={p.y - 10} textAnchor="middle" fontSize="10"
+                        fontWeight="800" fill={nodeStroke(n)}>
+                    {n.type === 'end' ? (outcome === 'rejected' ? 'REJECTED' : 'COMPLETED') : 'NOW HERE'}
+                  </text>
+                )}
               </g>
             )
           })}
@@ -233,17 +313,20 @@ export function FlowDiagram({ pdd, height = 520 }) {
 
 
 export function ProcessFlowDynamic() {
+  // Only the workflows THIS person works on (admins/authors get all of them).
+  // Uses /v1/my-processes, NOT /v1/definitions, so the email adapter's use of
+  // /v1/definitions stays untouched.
   const [processes, setProcesses] = useState([])
   const [selected, setSelected] = useState('')
   const [pdd, setPdd] = useState(null)
   const [error, setError] = useState('')
 
   useEffect(() => {
-    get('/v1/definitions')
-      .then((rows) => {
-        const list = rows || []
+    get('/v1/my-processes')
+      .then((res) => {
+        const list = (res && res.processes) || []
         setProcesses(list)
-        setSelected((current) => current || (list[0] ? list[0].process_key : ''))
+        setSelected((current) => current || list[0] || '')
       })
       .catch((e) => setError(e.message || String(e)))
   }, [])
@@ -257,96 +340,31 @@ export function ProcessFlowDynamic() {
       .catch((e) => setError(e.message || String(e)))
   }, [selected])
 
-  const layout = pdd ? computeLayout(pdd) : null
-
   return (
     <section className="view" aria-labelledby="flow-heading">
       <div className="view-heading">
         <div>
           <p className="eyebrow">Process definition</p>
           <h2 id="flow-heading">Process Flow</h2>
-          <p>The diagram is generated from the selected process&apos;s nodes and edges.</p>
+          <p>The diagram is built from the selected workflow&apos;s own steps and connections.</p>
         </div>
       </div>
 
-      <div className="toolbar">
-        <label className="config-field">
-          <span>Process</span>
-          <select value={selected} onChange={(e) => setSelected(e.target.value)}>
-            {processes.length === 0 && <option value="">No published processes</option>}
-            {processes.map((p) => (
-              <option key={p.process_key} value={p.process_key}>{p.process_key} (v{p.latest_version})</option>
-            ))}
-          </select>
-        </label>
+      {/* Side-by-side buttons, exactly like the Builder's workflow strip. */}
+      <div className="process-strip" role="tablist" aria-label="Your workflows">
+        {processes.map((key) => (
+          <button type="button" key={key} role="tab" aria-selected={selected === key}
+            className={`process-chip ${selected === key ? 'active' : ''}`}
+            onClick={() => setSelected(key)}>{key}</button>
+        ))}
+        {processes.length === 0 && !error && (
+          <span className="muted">You are not assigned to any workflow yet — ask an admin.</span>
+        )}
       </div>
 
       {error && <p className="feedback error">{error}</p>}
       {selected && !pdd && !error && <div className="loading-panel">Loading definition…</div>}
-
-      {layout && (
-        <div className="flow-canvas" style={{ overflowX: 'auto' }}>
-          <svg
-            viewBox={`0 0 ${layout.width} ${layout.height}`}
-            width={layout.width}
-            height={layout.height}
-            role="img"
-            aria-label={`Flow diagram for ${selected}`}
-          >
-            <defs>
-              <marker id="pf-arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
-                <polygon points="0 0, 9 3.5, 0 7" fill="#94a3b8" />
-              </marker>
-            </defs>
-            {layout.links.map((link, idx) => {
-              const a = layout.pos[link.from]
-              const b = layout.pos[link.to]
-              if (!a || !b) return null
-              const x1 = a.x + layout.BW
-              const y1 = a.y + layout.BH / 2
-              const x2 = b.x
-              const y2 = b.y + layout.BH / 2
-              const mx = (x1 + x2) / 2
-              const d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`
-              const label = link.label && link.label.length > 16 ? `${link.label.slice(0, 15)}…` : link.label
-              return (
-                <g key={`edge-${idx}`}>
-                  <path d={d} fill="none" stroke="#94a3b8" strokeWidth="1.3" markerEnd="url(#pf-arrow)" />
-                  {label && (
-                    <text x={mx} y={(y1 + y2) / 2 - 4} textAnchor="middle" fontSize="10" fill="#64748b">
-                      {label}
-                    </text>
-                  )}
-                </g>
-              )
-            })}
-            {layout.nodes.map((n) => {
-              const p = layout.pos[n.id]
-              if (!p) return null
-              return (
-                <g key={n.id}>
-                  <rect
-                    x={p.x}
-                    y={p.y}
-                    width={layout.BW}
-                    height={layout.BH}
-                    rx="12"
-                    fill={NODE_FILL[n.type] || '#f1f5f9'}
-                    stroke={NODE_STROKE[n.type] || '#cbd5e1'}
-                    strokeWidth="1.5"
-                  />
-                  <text x={p.x + layout.BW / 2} y={p.y + 24} textAnchor="middle" fontSize="13" fontWeight="600" fill="#1e293b">
-                    {n.id}
-                  </text>
-                  <text x={p.x + layout.BW / 2} y={p.y + 42} textAnchor="middle" fontSize="10" fill="#64748b">
-                    {n.type}
-                  </text>
-                </g>
-              )
-            })}
-          </svg>
-        </div>
-      )}
+      {pdd && <FlowDiagram pdd={pdd} height={560} />}
     </section>
   )
 }

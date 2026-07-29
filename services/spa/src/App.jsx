@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { get, post, put, upload } from './api'
 import keycloak from './keycloak'
 import { uuid } from './uuid'
-import { GenericTaskForm, ProcessFlowDynamic } from './generic'
+import { FlowDiagram, GenericTaskForm, ProcessFlowDynamic } from './generic'
 import { ProcessBuilder } from './builder'
 import { AdminPanel } from './admin'
 import './App.css'
@@ -48,6 +48,132 @@ function formatMoney(value) {
   if (value === null || value === undefined || value === '') return '—'
   const number = Number(value)
   return Number.isNaN(number) ? String(value) : `$${number.toLocaleString()}`
+}
+
+// Work out ONE transaction's journey through its workflow, using the audit
+// events plus the workflow definition:
+//   * AI decision events record which decision step ran and which route it chose
+//   * task-created events record which human step was entered
+//   * automated / timer steps in between are filled in by following the definition
+// Returns the steps visited, the connections actually followed, where it is now,
+// and the outcome (so a finished step can be tinted green / red).
+function deriveJourney(pdd, events, status) {
+  const nodes = Array.isArray(pdd && pdd.nodes) ? pdd.nodes : []
+  if (!nodes.length) return null
+  const byId = {}
+  nodes.forEach((n) => { byId[n.id] = n })
+  const nextOf = (n) => (n && typeof n.next === 'string' ? n.next : null)
+
+  const anchors = []                 // human/decision steps really entered, in order
+  const routes = {}                  // decision step -> the routes it chose, in order
+  for (const e of events || []) {
+    const p = e.payload || {}
+    if (e.type === 'LLM_DECISION' && p.node_id) {
+      anchors.push(p.node_id)
+      ;(routes[p.node_id] = routes[p.node_id] || []).push(p.route)
+    } else if (e.type === 'TASK_CREATED' && p.node_id) {
+      anchors.push(p.node_id)
+    }
+  }
+
+  const visited = new Set()
+  const taken = new Set()
+  const order = []
+  const used = {}
+  const targetOf = (id) => {
+    const n = byId[id]
+    if (!n) return null
+    if (n.type === 'llm_decision' || n.type === 'decision') {
+      const q = routes[id] || []
+      const i = used[id] || 0
+      used[id] = i + 1
+      const route = q[i]
+      return route == null ? null : ((n.edges || {})[route] || null)
+    }
+    return nextOf(n)
+  }
+
+  // Every step a node can lead to (used to fill gaps we can't compute directly).
+  const outgoing = (n) => {
+    if (!n) return []
+    const out = []
+    if (typeof n.next === 'string') out.push(n.next)
+    if (n.edges && !Array.isArray(n.edges)) Object.values(n.edges).forEach((t) => out.push(t))
+    if (Array.isArray(n.edges)) n.edges.forEach((e) => { if (e && e.to) out.push(e.to) })
+    return out.filter(Boolean)
+  }
+  // Shortest route between two steps, so automated steps sitting between two
+  // recorded points (e.g. finance -> finalize -> end_approved) are included.
+  const shortestPath = (from, to) => {
+    if (from === to) return [from]
+    const queue = [[from]]
+    const seen = new Set([from])
+    while (queue.length) {
+      const path = queue.shift()
+      for (const nb of outgoing(byId[path[path.length - 1]])) {
+        if (seen.has(nb)) continue
+        const nextPath = [...path, nb]
+        if (nb === to) return nextPath
+        seen.add(nb)
+        queue.push(nextPath)
+      }
+    }
+    return null
+  }
+
+  const startNode = nodes.find((n) => n.type === 'start')
+  let cur = startNode ? nextOf(startNode) : nodes[0].id
+  let ai = 0
+  for (let guard = 0; guard < 300 && cur; guard += 1) {
+    visited.add(cur)
+    order.push(cur)
+    while (anchors[ai] === cur) ai += 1          // consume matching anchors
+    const n = byId[cur]
+    if (!n || n.type === 'end') break
+
+    const direct = targetOf(cur)
+    if (direct) {                                // decisions + single-exit steps
+      taken.add(`${cur}>${direct}`)
+      cur = direct
+      continue
+    }
+
+    // A human step: the definition alone can't say which way it went. Aim for
+    // the next step the events show was entered; if the run has finished, aim
+    // for the matching end step. Then fill in everything on the way.
+    let aim = anchors[ai] || null
+    if (!aim && status && status !== 'running') {
+      const endNode = nodes.find((x) => x.type === 'end' && x.outcome === status)
+      aim = endNode ? endNode.id : null
+    }
+    if (!aim || aim === cur) break
+    const path = shortestPath(cur, aim)
+    if (!path) break
+    for (let k = 1; k < path.length; k += 1) {
+      taken.add(`${path[k - 1]}>${path[k]}`)
+      visited.add(path[k])
+      order.push(path[k])
+    }
+    cur = aim
+  }
+
+  let current
+  if (status && status !== 'running') {
+    const endNode = nodes.find((x) => x.type === 'end' && x.outcome === status)
+    current = endNode ? endNode.id : order[order.length - 1]
+  } else {
+    const lastTask = [...(events || [])].reverse()
+      .find((e) => e.type === 'TASK_CREATED' && (e.payload || {}).node_id)
+    current = lastTask ? lastTask.payload.node_id : order[order.length - 1]
+  }
+  if (current) visited.add(current)
+
+  return {
+    visited: [...visited],
+    taken: [...taken],
+    current,
+    outcome: status === 'approved' || status === 'rejected' ? status : undefined,
+  }
 }
 
 // Show whatever fields THIS process carries (invoice: vendor/amount;
@@ -680,6 +806,11 @@ function Monitor() {
   const [filter, setFilter] = useState('total')
   const [page, setPage] = useState(1)
   const [selected, setSelected] = useState(null)
+  const [tab, setTab] = useState('flow')          // popup tab: 'flow' | 'log'
+  const [journey, setJourney] = useState(null)    // visited steps / path / current
+  const [journeyPdd, setJourneyPdd] = useState(null)
+  const [flowLoading, setFlowLoading] = useState(false)
+  const [flowError, setFlowError] = useState('')
   const [history, setHistory] = useState([])
   const [loading, setLoading] = useState(true)
   const [historyLoading, setHistoryLoading] = useState(false)
@@ -687,8 +818,9 @@ function Monitor() {
   const [historyError, setHistoryError] = useState('')
 
   useEffect(() => {
-    get('/v1/definitions')
-      .then((rows) => setProcesses((rows || []).map((r) => r.process_key).filter(Boolean)))
+    // Only the workflows this person is allowed to see (admins/authors get all).
+    get('/v1/my-processes')
+      .then((res) => setProcesses((res && res.processes) || []))
       .catch(() => setProcesses([]))
   }, [])
 
@@ -751,17 +883,44 @@ function Monitor() {
     setSelected(null)
   }
 
+  // Opening the popup loads only the FAST things (raw events + the workflow
+  // definition) so the Flow tab appears immediately. The AI-narrated audit is
+  // slow (it asks the model to write a sentence per event), so it is fetched
+  // ONLY when the Log tab is actually opened.
   async function selectTransaction(transaction) {
     setSelected(transaction)
+    setTab('flow')
     setHistory([])
     setHistoryError('')
-    setHistoryLoading(true)
+    setJourney(null)
+    setFlowError('')
+    setFlowLoading(true)
+    try {
+      const [events, def] = await Promise.all([
+        get(`/v1/transactions/${encodeURIComponent(transaction.id)}/history`),
+        transaction.process_key
+          ? get(`/v1/definitions/${encodeURIComponent(transaction.process_key)}`)
+          : Promise.resolve(null),
+      ])
+      setJourneyPdd(def)
+      setJourney(deriveJourney(def, events || [], normalizeStatus(transaction.status)))
+    } catch (requestError) {
+      setFlowError(apiErrorMessage(requestError))
+    } finally {
+      setFlowLoading(false)
+    }
+  }
 
+  async function openLogTab() {
+    setTab('log')
+    if (history.length || historyLoading) return          // already have it
+    setHistoryError('')
+    setHistoryLoading(true)
     try {
       // AI-narrated audit: one clean sentence per event (the backend falls back
       // to deterministic text when the LLM is slow/unavailable — never raw JSON).
       const events = await get(
-        `/v1/transactions/${encodeURIComponent(transaction.id)}/history?format=narrative`,
+        `/v1/transactions/${encodeURIComponent(selected.id)}/history?format=narrative`,
       )
       setHistory(events)
     } catch (requestError) {
@@ -770,6 +929,16 @@ function Monitor() {
       setHistoryLoading(false)
     }
   }
+
+  function closeModal() { setSelected(null) }
+
+  // Escape closes the popup.
+  useEffect(() => {
+    if (!selected) return undefined
+    const onKey = (e) => { if (e.key === 'Escape') closeModal() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [selected])
 
   return (
     <section className="view" aria-labelledby="monitor-heading">
@@ -871,17 +1040,27 @@ function Monitor() {
         </>
       )}
 
+      {/* Popup: blurred backdrop, ~85% of the screen, Flow tab first then Log.
+          Closes on ×, on a backdrop click, or with Escape. */}
       {selected && (
-        <section className="audit-panel" aria-labelledby="audit-heading">
+        <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) closeModal() }}>
+        <section className="modal-panel" role="dialog" aria-modal="true" aria-labelledby="audit-heading">
           <div className="audit-heading">
             <div>
               <p className="eyebrow">Transaction drill-down</p>
-              <h3 id="audit-heading">Audit trail</h3>
+              <h3 id="audit-heading">{selected.process_key || 'Transaction'}</h3>
               <p className="mono">{selected.id}</p>
             </div>
-            <button className="icon-button" type="button" onClick={() => setSelected(null)} aria-label="Close audit trail">
+            <button className="icon-button" type="button" onClick={closeModal} aria-label="Close">
               ×
             </button>
+          </div>
+
+          <div className="modal-tabs" role="tablist">
+            <button type="button" role="tab" aria-selected={tab === 'flow'}
+              className={tab === 'flow' ? 'active' : ''} onClick={() => setTab('flow')}>Flow</button>
+            <button type="button" role="tab" aria-selected={tab === 'log'}
+              className={tab === 'log' ? 'active' : ''} onClick={openLogTab}>Log</button>
           </div>
 
           <dl className="monitor-detail-grid">
@@ -907,26 +1086,59 @@ function Monitor() {
             </div>
           </dl>
 
-          {historyLoading && <LoadingPanel label="Loading ordered event history…" />}
-          {historyError && <Feedback feedback={{ type: 'error', message: historyError }} />}
-          {!historyLoading && !historyError && history.length === 0 && (
-            <p className="muted">No audit events have been recorded for this transaction.</p>
-          )}
-          <ol className="timeline">
-            {history.map((event, index) => (
-              <li key={`${event.occurred_at}-${event.type}-${index}`}>
-                <span className="timeline-dot" />
-                <div className="timeline-card">
-                  <p className="narrative-line">
-                    <time>{formatDate(event.occurred_at)}</time>
-                    {' — '}
-                    {event.text}
-                  </p>
-                </div>
-              </li>
-            ))}
-          </ol>
+          <div className="modal-body">
+            {tab === 'flow' && (
+              <>
+                {flowLoading && <LoadingPanel label="Building the flow…" />}
+                {flowError && <Feedback feedback={{ type: 'error', message: flowError }} />}
+                {!flowLoading && !flowError && !journeyPdd && (
+                  <p className="muted">This transaction&apos;s workflow definition could not be loaded.</p>
+                )}
+                {!flowLoading && journeyPdd && (
+                  <>
+                    <p className="muted flow-legend">
+                      Bold blue = the path this request travelled · ringed step = where it is now ·
+                      faded = never used
+                    </p>
+                    <FlowDiagram
+                      pdd={journeyPdd}
+                      height={430}
+                      visited={journey ? journey.visited : undefined}
+                      taken={journey ? journey.taken : undefined}
+                      current={journey ? journey.current : undefined}
+                      outcome={journey ? journey.outcome : undefined}
+                    />
+                  </>
+                )}
+              </>
+            )}
+
+            {tab === 'log' && (
+              <>
+                {historyLoading && <LoadingPanel label="Writing the audit trail…" />}
+                {historyError && <Feedback feedback={{ type: 'error', message: historyError }} />}
+                {!historyLoading && !historyError && history.length === 0 && (
+                  <p className="muted">No audit events have been recorded for this transaction.</p>
+                )}
+                <ol className="timeline">
+                  {history.map((event, index) => (
+                    <li key={`${event.occurred_at}-${event.type}-${index}`}>
+                      <span className="timeline-dot" />
+                      <div className="timeline-card">
+                        <p className="narrative-line">
+                          <time>{formatDate(event.occurred_at)}</time>
+                          {' — '}
+                          {event.text}
+                        </p>
+                      </div>
+                    </li>
+                  ))}
+                </ol>
+              </>
+            )}
+          </div>
         </section>
+        </div>
       )}
     </section>
   )
@@ -951,8 +1163,21 @@ function App() {
   if (isOps) navTabs.push({ id: 'admin', label: 'Admin' })
   const [activeTab, setActiveTab] = useState(navTabs[0].id)
 
+  // Measure the sticky header+tabs once (and on resize) so anything that must
+  // sit below them (the Builder's sticky preview) always lines up.
+  useEffect(() => {
+    const measure = () => {
+      const el = document.querySelector('.app-top')
+      if (el) document.documentElement.style.setProperty('--top-h', `${el.offsetHeight}px`)
+    }
+    measure()
+    window.addEventListener('resize', measure)
+    return () => window.removeEventListener('resize', measure)
+  }, [])
+
   return (
     <div className="app-shell">
+      <div className="app-top">
       <header className="app-header">
         <div className="brand">
           <span className="brand-mark" aria-hidden="true">W</span>
@@ -991,6 +1216,7 @@ function App() {
           </button>
         ))}
       </nav>
+      </div>
 
       <main>
         {activeTab === 'tasks' && <TaskInbox roles={roles} username={username} />}
