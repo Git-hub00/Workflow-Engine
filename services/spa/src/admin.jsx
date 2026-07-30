@@ -9,9 +9,11 @@ import { get, post, put, del } from './api'
 
 const CORE_ROLES = ['ops_admin', 'process_author']
 
-// Reusable checkbox picker for selecting a set of roles.
-function RolePicker({ roles, selected, onToggle }) {
-  if (!roles.length) return <span className="muted">No roles yet — create one above.</span>
+// Reusable checkbox picker for a set of options (roles OR workflows), so the empty
+// message must not say "roles" — it appeared verbatim under "Workflows this person
+// works on" when no workflow existed yet.
+function RolePicker({ roles, selected, onToggle, emptyMessage = 'Nothing to choose yet.' }) {
+  if (!roles.length) return <span className="muted">{emptyMessage}</span>
   return (
     <div className="chip-picker">
       {roles.map((r) => (
@@ -37,11 +39,19 @@ export function AdminPanel() {
 
   async function load() {
     try {
-      const [r, u, d] = await Promise.all([get('/v1/admin/roles'), get('/v1/admin/users'),
-        get('/v1/definitions').catch(() => [])])
-      setProcesses((d || []).map((x) => x.process_key).filter(Boolean))
-      setRoles(r || [])
-      setUsers(u || [])
+      // The workflow list is fetched separately and its failure REPORTED: swallowing
+      // it left the workflow picker silently empty, so an admin would save a user
+      // assigned to no workflow — which means that person sees nothing at all.
+      const [r, u] = await Promise.all([get('/v1/admin/roles'), get('/v1/admin/users')])
+      setRoles(Array.isArray(r) ? r : [])
+      setUsers(Array.isArray(u) ? u : [])
+      try {
+        const d = await get('/v1/definitions')
+        setProcesses((Array.isArray(d) ? d : []).map((x) => x.process_key).filter(Boolean))
+      } catch (e) {
+        setProcesses([])
+        setFeedback({ type: 'error', message: `Could not load the workflow list: ${e.message || e}` })
+      }
     } catch (e) {
       setFeedback({ type: 'error', message: e.message || String(e) })
     }
@@ -71,7 +81,12 @@ export function AdminPanel() {
     const name = newRole.trim()
     run(async () => { await post('/v1/admin/roles', { name }); setNewRole('') }, `Role '${name}' saved.`)
   }
-  const deleteRole = (name) => run(() => del(`/v1/admin/roles/${encodeURIComponent(name)}`), `Role '${name}' deleted.`)
+  // Confirm both deletes: they are irreversible Keycloak operations and fired on a
+  // single click, with the buttons sitting right next to Edit.
+  const deleteRole = (name) => {
+    if (!window.confirm(`Delete the role “${name}”? Anyone holding it loses that access.`)) return
+    run(() => del(`/v1/admin/roles/${encodeURIComponent(name)}`), `Role '${name}' deleted.`)
+  }
 
   const createUser = () => {
     if (!nu.username.trim()) return
@@ -86,18 +101,25 @@ export function AdminPanel() {
       setNu({ username: '', email: '', password: '12345', roles: [], processes: [] })
     }, `User '${nu.username.trim()}' saved.`)
   }
-  const deleteUser = (username) => run(() => del(`/v1/admin/users/${encodeURIComponent(username)}`), `User '${username}' deleted.`)
+  const deleteUser = (username) => {
+    if (!window.confirm(`Delete the user “${username}”? This cannot be undone.`)) return
+    run(() => del(`/v1/admin/users/${encodeURIComponent(username)}`), `User '${username}' deleted.`)
+  }
 
   function startEdit(u) {
     setEditing(u.username)
     setEdit({ email: u.email || '', password: '', roles: u.roles || [],
-      processes: u.processes || [], new_username: u.username })
+      processes: u.processes || [], new_username: u.username,
+      // roles_ok=false means the API could not READ this person's roles. Submitting
+      // the empty list we were shown would delete every role they have, so the roles
+      // field is omitted from the update in that case.
+      rolesKnown: u.roles_ok !== false })
   }
   const saveEdit = (username) => run(async () => {
     await put(`/v1/admin/users/${encodeURIComponent(username)}`, {
       email: edit.email || null,
       password: edit.password || null,
-      roles: edit.roles,
+      ...(edit.rolesKnown ? { roles: edit.roles } : {}),
       processes: edit.processes,
       new_username: edit.new_username && edit.new_username !== username ? edit.new_username : null,
     })
@@ -152,9 +174,12 @@ export function AdminPanel() {
             <label className="field"><span>Password</span>
               <input value={nu.password} onChange={(e) => setNu({ ...nu, password: e.target.value })} /></label>
             <div className="field"><span>Roles</span>
-              <RolePicker roles={roles} selected={nu.roles} onToggle={(r) => toggle(nu.roles, (v) => setNu({ ...nu, roles: v }), r)} /></div>
+              <RolePicker roles={roles} selected={nu.roles} emptyMessage="No roles yet — create one above."
+                onToggle={(r) => toggle(nu.roles, (v) => setNu({ ...nu, roles: v }), r)} /></div>
             <div className="config-field"><span>Workflows this person works on</span>
-              <RolePicker roles={processes} selected={nu.processes} onToggle={(p) => toggle(nu.processes, (v) => setNu({ ...nu, processes: v }), p)} />
+              <RolePicker roles={processes} selected={nu.processes}
+                emptyMessage="No workflows published yet — an author must save one first."
+                onToggle={(p) => toggle(nu.processes, (v) => setNu({ ...nu, processes: v }), p)} />
               <span className="muted" style={{ fontSize: '0.75rem' }}>Tick none and they see no tasks. A person can be in several workflows.</span></div>
             <button className="primary-button" type="submit" disabled={busy}>Add user</button>
           </form>
@@ -176,9 +201,16 @@ export function AdminPanel() {
                     <td><input value={edit.new_username} onChange={(e) => setEdit({ ...edit, new_username: e.target.value })} /></td>
                     <td><input value={edit.email} onChange={(e) => setEdit({ ...edit, email: e.target.value })} /></td>
                     <td colSpan={2}>
-                      <RolePicker roles={roles} selected={edit.roles} onToggle={(r) => toggle(edit.roles, (v) => setEdit({ ...edit, roles: v }), r)} />
+                      {edit.rolesKnown === false && (
+                        <p className="muted">This person's roles could not be read, so they are left
+                          unchanged when you save.</p>
+                      )}
+                      <RolePicker roles={roles} selected={edit.roles} emptyMessage="No roles yet."
+                        onToggle={(r) => toggle(edit.roles, (v) => setEdit({ ...edit, roles: v }), r)} />
                       <div className="mini-label" style={{ marginTop: 8 }}>Workflows</div>
-                      <RolePicker roles={processes} selected={edit.processes} onToggle={(p) => toggle(edit.processes, (v) => setEdit({ ...edit, processes: v }), p)} />
+                      <RolePicker roles={processes} selected={edit.processes}
+                        emptyMessage="No workflows published yet."
+                        onToggle={(p) => toggle(edit.processes, (v) => setEdit({ ...edit, processes: v }), p)} />
                       <input className="pw-input" placeholder="new password (optional)" value={edit.password} onChange={(e) => setEdit({ ...edit, password: e.target.value })} />
                     </td>
                     <td className="row-actions">
@@ -201,7 +233,7 @@ export function AdminPanel() {
                   </tr>
                 )
               ))}
-              {users.length === 0 && <tr><td colSpan="4" className="muted">No users yet.</td></tr>}
+              {users.length === 0 && <tr><td colSpan="5" className="muted">No users yet.</td></tr>}
             </tbody>
           </table>
         </div>

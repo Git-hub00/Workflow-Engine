@@ -42,7 +42,37 @@ class ProcState(TypedDict, total=False):
     _next: str
 
 
+class DefinitionError(Exception):
+    """The workflow DEFINITION is wrong (a dead end, an unknown step). Raised so the
+    run fails visibly instead of quietly ending as if it had completed."""
+
+
 # --- pure edge helpers ----------------------------------------------------
+def _as_num(v):
+    """Number for comparison, or None if the value isn't numeric."""
+    if isinstance(v, bool) or v is None:
+        return None
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _cmp(lhs, rhs, op: str) -> bool:
+    """Compare two values: numerically when BOTH sides look numeric (so "1500" and
+    1500 match), otherwise as text."""
+    a, b = _as_num(lhs), _as_num(rhs)
+    if a is None or b is None:
+        a, b = str(lhs), str(rhs)
+    if op == ">":
+        return a > b
+    if op == ">=":
+        return a >= b
+    if op == "<":
+        return a < b
+    return a <= b
+
+
 def _match(when: Optional[str], ctx: dict) -> bool:
     if when is None:
         return False
@@ -55,6 +85,23 @@ def _match(when: Optional[str], ctx: dict) -> bool:
     if "!=" in w:
         lhs, rhs = w.split("!=", 1)
         return str(ctx.get(lhs.strip())) != rhs.strip().strip("'\"")
+    # NUMERIC / ORDERING comparisons. These used to be unsupported, so a perfectly
+    # reasonable rule like "amount >= 5000" fell through to the truthiness check on
+    # the literal string, was always False, matched NO connection, and the run
+    # ended as "completed" — a silent auto-approval. Longest operators first, so
+    # ">=" is never read as ">".
+    for op in (">=", "<=", ">", "<"):
+        if op in w:
+            lhs, rhs = w.split(op, 1)
+            lhs, rhs = lhs.strip(), rhs.strip().strip("'\"")
+            if lhs in ctx or rhs in ctx:
+                left = ctx.get(lhs, lhs)
+                right = ctx.get(rhs, rhs)
+                try:
+                    return _cmp(left, right, op)
+                except TypeError:
+                    return False
+            return False
     return bool(ctx.get(w))
 
 
@@ -73,11 +120,23 @@ def _canon(node: dict) -> dict:
 
 
 def compute_next(node: dict, state: dict):
-    """Next step id to run (or None for a terminal step). Works on any dialect."""
+    """Next step id to run (or None for a terminal step). Works on any dialect.
+
+    A NON-terminal step that resolves to nothing raises DefinitionError instead of
+    returning None. Returning None sent the run straight to the graph's END, where
+    the outcome defaulted to "completed" — so a broken connection or an unmatched
+    condition looked exactly like a successful finish, and the requester was told
+    their request had gone through."""
     n = _canon(node)
     ntype = n["type"]
+    nid = n.get("id")
     if ntype in ("start", "automated", "timer"):
-        return n.get("next")
+        nxt = n.get("next")
+        if not nxt:
+            raise DefinitionError(
+                f"step '{nid}' ({ntype}) has no next step — connect it to another step "
+                "or to an end step")
+        return nxt
     if ntype == "decision":
         route = state.get("route")
         for e in n.get("edges") or []:
@@ -86,9 +145,21 @@ def compute_next(node: dict, state: dict):
         for r in n.get("routes") or []:
             if r.get("edge") == route:
                 return r.get("to")
-        return None
+        if route is None:
+            raise DefinitionError(
+                f"decision step '{nid}' matched none of its rules — add an "
+                "'Otherwise' rule so every request has a route")
+        raise DefinitionError(
+            f"decision step '{nid}' chose route '{route}', which is not connected "
+            "to any step")
     if ntype == "gateway":
-        return _pick_edge(n.get("edges"), {**(state.get("data") or {}), "route": state.get("route")})
+        target = _pick_edge(n.get("edges"),
+                            {**(state.get("data") or {}), "route": state.get("route")})
+        if not target:
+            raise DefinitionError(
+                f"gateway step '{nid}' matched none of its conditions — add a "
+                "'default' branch so every request has a route")
+        return target
     if ntype == "human":
         edges = n.get("edges") or []
         if edges:
@@ -97,9 +168,25 @@ def compute_next(node: dict, state: dict):
                 "route": state.get("route"),
                 "quorum_approved": state.get("quorum_approved"),
             }
-            return _pick_edge(edges, ctx)
-        return n.get("next")
-    return None  # end / unknown
+            target = _pick_edge(edges, ctx)
+            if not target:
+                raise DefinitionError(
+                    f"step '{nid}' has no branch for decision "
+                    f"'{ctx.get('decision')}' — add a 'default' branch")
+            return target
+        nxt = n.get("next")
+        if not nxt:
+            raise DefinitionError(f"step '{nid}' has no next step")
+        return nxt
+    if ntype == "end":
+        return None                       # terminal by design
+    # Anything else is a step type this engine does not implement — for example
+    # gateway_fork / gateway_join, which the PDD schema accepts but nothing here can
+    # run. These used to fall through to `return None`, which sends the run to the
+    # graph's END where the outcome defaults to "completed": the request was reported
+    # as finished successfully while the step never happened.
+    raise DefinitionError(
+        f"step '{nid}' has the type '{ntype}', which this engine cannot run yet")
 
 
 class Handlers:

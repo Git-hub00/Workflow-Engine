@@ -184,6 +184,20 @@ def decide(node: dict, data: dict, cfg: dict) -> dict:
     """Run the bounded decision for a PDD llm_decision node. Returns the same
     shape the interpreter/audit expect: route, missing, anomalies, rationale."""
     routes = node.get("routes", [])
+    # Pre-flight the deterministic rules. If NOTHING matches there is no route to
+    # branch to, and invoking the graph would blow up inside LangGraph's conditional
+    # edge with an opaque "unknown node" error — inside a retried activity, which
+    # meant the run retried forever. Return the honest result instead and let the
+    # engine report a clear "add an Otherwise rule" definition error.
+    pre = _assess({"data": data, "cfg": cfg, "routes": routes})
+    if pre.get("route") is None:
+        return {
+            "route": None,
+            "missing": pre.get("missing", []),
+            "anomalies": pre.get("anomalies", []),
+            "rationale": ("No rule on this decision step matched this request, so no "
+                          "route could be chosen. Add an 'Otherwise' rule."),
+        }
     final = build_graph(routes).invoke({"data": data, "cfg": cfg, "routes": routes})
     return {
         "route": final.get("route"),

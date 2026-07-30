@@ -18,7 +18,7 @@ New files:
 - `deploy/docker/web-nginx.conf` — the web container's nginx (proxies to `api:8000`).
 - `docker-compose.app.yml` — overlay adding `api`, `worker`, `adapter`, `migrate`, `web`.
 - `scripts/docker_bootstrap.sh` — one-shot: waits for infra, runs migrations + seeds.
-- `scripts/deploy_docker.sh` — build + up + health check (replaces `deploy_vm.sh`).
+- `scripts/deploy_docker.sh` — build + up + health check. This is the deploy entrypoint.
 - `.dockerignore`.
 
 Code made container-ready (still defaults to localhost, so systemd keeps working):
@@ -74,18 +74,18 @@ For rapid local iteration you can bind-mount the source with `uvicorn --reload`
 
 ## CI/CD
 
-`.github/workflows/deploy.yml` still runs `scripts/deploy_vm.sh` (systemd). To
-switch the pipeline to Docker, change that one line to `scripts/deploy_docker.sh`.
-The `.env` it writes needs no changes — compose overrides the host addresses.
+`.github/workflows/deploy.yml` runs `scripts/deploy_docker.sh` on every push to
+`LangGraph-1`. The `.env` it writes needs no changes — compose overrides the host
+addresses.
 
-## Rollback to systemd
+The old systemd deploy path (`scripts/deploy_vm.sh` plus a host nginx) has been
+removed: it was superseded by these containers and `deploy_docker.sh` warns if
+those old services are still running on the VM. If you find them enabled from a
+past deploy, disable them once:
 
 ```bash
-docker compose -f docker-compose.dev.yml -f docker-compose.app.yml down
-sudo systemctl enable --now workflow-api workflow-worker workflow-adapter nginx
+sudo systemctl disable --now workflow-api workflow-worker workflow-adapter nginx
 ```
-
-(Infra keeps running either way.)
 
 ## Known follow-ups (not addressed here)
 

@@ -1,11 +1,15 @@
 # services/worker/notifier/email_adapter.py
 #
 # WHY this file exists:
-# The PARSING half of the email adapter (Section 9.3) — the pure logic that turns
-# an inbound email (subject + body + Message-ID) into a POST /v1/events payload.
-# These functions are deliberately PURE: no IMAP, no network, no I/O. That keeps
-# them fully unit-testable, and lets the (later) live polling loop stay a thin
-# shell that just fetches messages and calls build_event_payload() + HTTP.
+# The email adapter (Section 9.3) — it turns inbound email into workflow input:
+#   * a reply to a notification  -> a decision posted to /v1/events, which resumes
+#     the durably-paused run;
+#   * any other mail arriving in a workflow's mailbox -> a NEW transaction.
+#
+# The parsing half (subject/body/field/decision readers) is deliberately PURE — no
+# IMAP, no network, no I/O — so it is fully unit-testable on its own; see
+# scripts/test_email_reply.py. The live poller at the bottom is a thin shell that
+# only fetches messages and calls those parsers.
 
 import email
 import os
@@ -20,10 +24,11 @@ import requests
 from dotenv import load_dotenv
 from imapclient import IMAPClient
 
-# Matches our notification-subject tag "[invoice-<uuid>]" and captures the uuid.
-# The workflow/transaction id is the <uuid> part after "invoice-".
+# Matches our notification-subject tag "[<prefix>-<uuid>]" and captures the uuid.
+# The prefix is ANY word (we send "invoice-", but a future/renamed prefix must not
+# break reply correlation — the uuid shape is what actually identifies the run).
 _TXN_RE = re.compile(
-    r"\[invoice-("
+    r"\[[A-Za-z0-9_]+-("
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
     r")\]"
 )
@@ -33,7 +38,15 @@ def decode_subject(raw_subject: str) -> str:
     # Email subjects arrive as MIME "encoded-words" (e.g. "=?UTF-8?Q?caf=C3=A9?=")
     # for any non-ASCII content. make_header(decode_header(...)) reassembles the
     # parts into a normal Unicode string.
-    return str(make_header(decode_header(raw_subject)))
+    #
+    # NEVER raises: a malformed encoded-word or an unknown charset name makes
+    # decode_header/make_header raise (LookupError / UnicodeDecodeError). This
+    # function is called from the poll loop, so a single hostile subject line used
+    # to abort the whole polling pass and stall EVERY pending reply in that inbox.
+    try:
+        return str(make_header(decode_header(raw_subject or "")))
+    except Exception:
+        return str(raw_subject or "")
 
 
 def extract_txn_id(subject: str) -> str | None:
@@ -43,11 +56,59 @@ def extract_txn_id(subject: str) -> str | None:
     return m.group(1) if m else None
 
 
+# Lines that begin the QUOTED ORIGINAL in a reply. Everything from the first such
+# line onwards is the mail WE sent, not what the person wrote.
+_QUOTE_MARKERS = (
+    re.compile(r"^\s*>"),                                     # > quoted line
+    re.compile(r"^\s*On .*wrote:\s*$", re.IGNORECASE),         # Gmail / Apple Mail
+    re.compile(r"^\s*-{2,}\s*Original Message\s*-{2,}", re.IGNORECASE),
+    re.compile(r"^\s*-{2,}\s*Forwarded message\s*-{2,}", re.IGNORECASE),
+    re.compile(r"^\s*_{10,}\s*$"),                             # Outlook divider
+    re.compile(r"^\s*(From|Sent|To|Subject)\s*:\s*.+", re.IGNORECASE),  # Outlook header block
+)
+
+
+def strip_quoted(body: str) -> str:
+    """Return ONLY what the person typed, dropping the quoted original below it.
+
+    WHY THIS MATTERS (this was a real, severe bug):
+    our approval email ends with "...reply with 'approve' or 'reject'", and our
+    request-info email lists "poNumber: <value>" template lines. Almost every mail
+    client quotes that original text underneath the reply. So:
+      * extract_decision() scanned the WHOLE body, found the word "reject" in OUR
+        OWN quoted instructions, and (reject having priority) turned EVERY approval
+        into a REJECTION;
+      * _parse_field_lines() walked every line and let the LAST match win, so the
+        quoted template line "poNumber: <value>" OVERWROTE the real value the
+        vendor typed above it.
+    Cutting the quoted part off before parsing fixes both."""
+    lines = (body or "").splitlines()
+    kept = []
+    for line in lines:
+        if any(rx.match(line) for rx in _QUOTE_MARKERS):
+            break
+        kept.append(line)
+    top = "\n".join(kept).strip()
+    # If the person replied INSIDE / BELOW the quote (nothing above it), fall back
+    # to the full body rather than seeing an empty reply.
+    return top if top else (body or "")
+
+
+# A value that is still our own template placeholder, e.g. "<value>" or "<amount>".
+_PLACEHOLDER_RE = re.compile(r"^<[^>]*>$")
+
+
+def _is_placeholder(value: str) -> bool:
+    return bool(_PLACEHOLDER_RE.match((value or "").strip()))
+
+
 def extract_decision(body: str) -> str | None:
     # Map the free-text reply to a decision, case-insensitively. Priority order is
     # reject > return > approve, so an ambiguous reply like "I approve but reject"
     # is treated as the more conservative "reject" (never auto-approve on doubt).
-    low = body.lower()
+    # Scans only the person's own words (the quoted original is stripped first),
+    # otherwise our own "reply approve or reject" instruction decides for them.
+    low = strip_quoted(body).lower()
     if "reject" in low:
         return "reject"
     if "return" in low:
@@ -57,30 +118,16 @@ def extract_decision(body: str) -> str | None:
     return None
 
 
-def build_event_payload(subject: str, body: str, message_id: str) -> dict | None:
-    # Combine the parsers into a ready-to-POST /v1/events body. If we can't find
-    # BOTH a transaction id and a decision, we can't act -> return None.
-    decoded = decode_subject(subject)
-    txn_id = extract_txn_id(decoded)
-    decision = extract_decision(body)
-    if txn_id is None or decision is None:
-        return None
-
-    # WHY idempotency_key = "email-" + Message-ID: a Message-ID uniquely identifies
-    # an email. If the SAME email is processed twice (poller restart, overlapping
-    # runs, IMAP re-delivery), it yields the SAME key — so /v1/events dedupes it to
-    # exactly one signal instead of acting on the reply twice.
-    return {
-        "transaction_id": txn_id,
-        "idempotency_key": "email-" + message_id,
-        "kind": "human",
-        "payload": {"decision": decision},
-    }
+# NOTE on idempotency: every reply posted below uses
+# idempotency_key = "email-" + Message-ID. A Message-ID uniquely identifies an email,
+# so if the SAME email is processed twice (poller restart, overlapping runs, IMAP
+# re-delivery) the key is identical and /v1/events collapses it to exactly one
+# signal instead of acting on the reply twice.
 
 
 # ---------------------------------------------------------------------------
 # Live adapter (IMAP + HTTP). The functions above stay pure/unit-testable; the
-# code below wires the proven IMAP connection (email_probe.py) and the parsers
+# code below wires the IMAP connection and the parsers
 # together into a running poller.
 # ---------------------------------------------------------------------------
 
@@ -118,14 +165,6 @@ def _pdf_attachment(msg):
             if payload:
                 return filename or "invoice.pdf", payload
     return None
-
-
-_START_RE = re.compile(r"\[start:([A-Za-z0-9_\-]+)\]", re.IGNORECASE)
-
-
-def _process_from_subject(subject: str):
-    m = _START_RE.search(subject or "")
-    return m.group(1) if m else None
 
 
 def _get_pdd(api_base_url: str, process_key: str):
@@ -208,6 +247,8 @@ def _norm_key(s: str) -> str:
 def _parse_body_fields(body: str, field_names) -> dict:
     # Parse "field: value" lines, matched to the process's data_schema field names
     # ignoring spaces/underscores/case (so "PO Number:" maps to poNumber).
+    # FIRST value wins and template placeholders ("<value>") are ignored, so a
+    # quoted copy of our own instructions can never overwrite a real answer.
     wanted = {_norm_key(name): name for name in (field_names or [])}
     out = {}
     for line in (body or "").splitlines():
@@ -215,8 +256,9 @@ def _parse_body_fields(body: str, field_names) -> dict:
             continue
         key, _, value = line.partition(":")
         canon = wanted.get(_norm_key(key))
-        if canon and value.strip():
-            out[canon] = value.strip()
+        value = value.strip()
+        if canon and value and canon not in out and not _is_placeholder(value):
+            out[canon] = value
     return out
 
 
@@ -265,7 +307,7 @@ def _process_new_transaction(msg, api_base_url: str, mailbox_name: str) -> str:
         resp = requests.post(
             f"{api_base_url}/v1/transactions",
             json={"process_key": process_key, "data": data, "submitted_by": sender or None},
-            timeout=30,
+            headers=_internal_headers(), timeout=30,
         )
     except Exception as exc:
         return f"error: create failed: {exc}"
@@ -275,22 +317,45 @@ def _process_new_transaction(msg, api_base_url: str, mailbox_name: str) -> str:
     return f"started {process_key} txn {txn_id} from {sender or 'unknown'} status=created"
 
 
-_REQUIRED_FIELDS = ["poNumber", "costCenter", "taxId"]
+def _schema_fields(api_base_url: str, process_key: str) -> list:
+    """The field names THIS workflow declares (pdd.data_schema). Used as the
+    fallback set when a reply has no decision and the task listed no required
+    fields — previously this fell back to the hardcoded invoice field names, so a
+    leave or refund reply carrying real values parsed as nothing."""
+    if not process_key:
+        return []
+    pdd = _get_pdd(api_base_url, process_key) or {}
+    schema = pdd.get("data_schema")
+    return list(schema.keys()) if isinstance(schema, dict) else []
 
 
 def _parse_field_lines(body: str, need):
     # Parse "field: value" lines; keys matched case-insensitively against the
-    # requested fields (the task's completion_policy.need, else the required set).
-    wanted = {_norm_key(name): name for name in (need or _REQUIRED_FIELDS)}
+    # requested fields (the task's completion_policy.need, else the given set).
+    # The quoted original is stripped, the FIRST value wins, and our own template
+    # placeholders ("<value>") are skipped — see strip_quoted() for why.
+    wanted = {_norm_key(name): name for name in (need or [])}
     parsed = {}
-    for line in body.splitlines():
+    for line in strip_quoted(body).splitlines():
         if ":" not in line:
             continue
         key, _, value = line.partition(":")
         canonical = wanted.get(_norm_key(key))
-        if canonical and value.strip():
-            parsed[canonical] = value.strip()
+        value = value.strip()
+        if canonical and value and canonical not in parsed and not _is_placeholder(value):
+            parsed[canonical] = value
     return parsed
+
+
+def _internal_headers() -> dict:
+    """Service credential for the write endpoints, when one is configured.
+
+    The adapter is a trusted backend process, not a browser, so it has no user
+    token. Setting INTERNAL_API_KEY in services/api/.env (which BOTH the API and
+    this adapter load) lets the API stop accepting anonymous /v1/events calls
+    without breaking email intake."""
+    key = os.getenv("INTERNAL_API_KEY")
+    return {"X-Internal-Key": key} if key else {}
 
 
 def _process_tagged_reply(txn_id: str, msg, message_id: str, api_base_url: str) -> str:
@@ -301,10 +366,18 @@ def _process_tagged_reply(txn_id: str, msg, message_id: str, api_base_url: str) 
         info = requests.get(f"{api_base_url}/v1/transactions/{txn_id}/open-task", timeout=10).json()
     except Exception as exc:
         return f"error: open-task lookup failed: {exc}"
-    open_task = info.get("open_task")
+    open_task = info.get("open_task") if isinstance(info, dict) else None
     if not open_task:
         # DEDUP: the other channel (app) already closed the task / the step passed.
         return f"skipped (no open task for {txn_id}; already handled) status=none"
+
+    # A MULTI-APPROVER (quorum) step cannot be settled by one email: each approver
+    # must claim their own slot and vote, so the votes can be counted. Completing it
+    # through /v1/events used to close the parent task while leaving every slot
+    # unvoted — the run then waited FOREVER with no task visible to anyone.
+    if open_task.get("is_quorum"):
+        return (f"skipped (step {open_task.get('node_id')!r} needs a multi-approver vote; "
+                "each approver must decide in the app) status=none")
 
     # GENERIC reply handling — works for ANY step name in ANY workflow.
     #   * the step asked for missing fields  -> parse "field: value" lines
@@ -320,8 +393,10 @@ def _process_tagged_reply(txn_id: str, msg, message_id: str, api_base_url: str) 
     else:
         decision = extract_decision(body)
         if decision is None:
-            # Maybe it is a data step whose fields we can still parse.
-            provided = _parse_field_lines(body, None)
+            # Maybe it is a data step whose fields we can still parse — matched
+            # against the fields THIS workflow declares, not a fixed list.
+            provided = _parse_field_lines(
+                body, _schema_fields(api_base_url, open_task.get("process_key")))
             if provided:
                 payload = {"decision": "resubmit", "data": provided}
             else:
@@ -337,7 +412,17 @@ def _process_tagged_reply(txn_id: str, msg, message_id: str, api_base_url: str) 
         "payload": payload,
     }
     try:
-        resp = requests.post(f"{api_base_url}/v1/events", json=request_body, timeout=10)
+        resp = requests.post(f"{api_base_url}/v1/events", json=request_body,
+                             headers=_internal_headers(), timeout=10)
+        # 5xx / transient: report an error so the mail stays UNSEEN and is retried.
+        # 4xx is PERMANENT (bad decision value, quorum step, unknown transaction) —
+        # retrying it forever would re-read the same mail every 15s, so we mark it
+        # handled and log why.
+        if resp.status_code >= 500:
+            return f"error: events HTTP {resp.status_code}: {resp.text[:160]}"
+        if resp.status_code >= 400:
+            return (f"skipped (rejected by API: HTTP {resp.status_code} "
+                    f"{resp.text[:120]}) status=none")
         try:
             status_field = resp.json().get("status")
         except Exception:
@@ -351,22 +436,30 @@ def process_message(raw_bytes: bytes, api_base_url: str, mailbox_name: str = "",
                     mailbox_address: str = "") -> str:
     # Turn ONE raw RFC822 message into (at most) one API call. Returns a short
     # status string; NEVER raises (a bad message must not kill the poll loop).
-    msg = email.message_from_bytes(raw_bytes)
-    subject = msg.get("Subject", "")
-    message_id = msg.get("Message-ID", "")
+    # The whole body is guarded: a malformed MIME structure, an undecodable part or
+    # a hostile header used to raise out of here, abort the polling pass and stall
+    # every other pending reply in that inbox until a human noticed.
+    try:
+        msg = email.message_from_bytes(raw_bytes)
+        subject = msg.get("Subject", "")
+        message_id = msg.get("Message-ID", "")
 
-    # Bounces, auto-replies and our own outgoing mail are NOT human input.
-    machine = is_machine_mail(msg, mailbox_address)
-    if machine:
-        return f"skipped ({machine}) status=none"
+        # Bounces, auto-replies and our own outgoing mail are NOT human input.
+        machine = is_machine_mail(msg, mailbox_address)
+        if machine:
+            return f"skipped ({machine}) status=none"
 
-    txn_id = extract_txn_id(decode_subject(subject))
-    if txn_id is not None:
-        # Tagged reply: a decision / resubmit on an existing transaction.
-        return _process_tagged_reply(txn_id, msg, message_id, api_base_url)
+        txn_id = extract_txn_id(decode_subject(subject))
+        if txn_id is not None:
+            # Tagged reply: a decision / resubmit on an existing transaction.
+            return _process_tagged_reply(txn_id, msg, message_id, api_base_url)
 
-    # No reply tag => generic intake: start a NEW transaction for the resolved process.
-    return _process_new_transaction(msg, api_base_url, mailbox_name)
+        # No reply tag => generic intake: start a NEW transaction for this process.
+        return _process_new_transaction(msg, api_base_url, mailbox_name)
+    except Exception as exc:
+        # Unparseable message: mark it handled (a retry would fail identically and
+        # re-read it every cycle forever) but say loudly what happened.
+        return f"skipped (could not process message: {type(exc).__name__}: {exc}) status=none"
 
 
 def poll_once(client, api_base_url: str, mailbox_name: str = "",
@@ -386,12 +479,35 @@ def poll_once(client, api_base_url: str, mailbox_name: str = "",
     results = []
     uids = client.search(["UNSEEN"])
     for uid in uids:
-        resp = client.fetch([uid], ["RFC822"])
-        raw = resp[uid][b"RFC822"]
+        # BODY.PEEK[] — NOT RFC822. Fetching "RFC822" makes the IMAP SERVER set the
+        # \Seen flag as a side effect of the read, BEFORE we know whether we managed
+        # to deliver the decision. So the careful "don't mark \Seen on error" logic
+        # below was useless: the mail was already read, the next SEARCH UNSEEN never
+        # returned it again, and a transient API outage SILENTLY LOST the reply
+        # forever. BODY.PEEK[] fetches the identical bytes WITHOUT setting \Seen, so
+        # we alone decide when a message counts as handled.
+        try:
+            resp = client.fetch([uid], ["BODY.PEEK[]"])
+            # Servers key the response as BODY[] even though we asked with .PEEK.
+            entry = resp.get(uid) or {}
+            raw = entry.get(b"BODY[]") or entry.get(b"RFC822")
+        except Exception as exc:
+            # One unreadable uid (deleted/moved between SEARCH and FETCH, or a
+            # server hiccup) must not abort the pass for every OTHER pending reply.
+            results.append(f"uid {uid}: error: fetch failed: {exc}")
+            continue
+        if not raw:
+            results.append(f"uid {uid}: error: fetch returned no body (will retry)")
+            continue
         result = process_message(raw, api_base_url, mailbox_name, mailbox_address)
         results.append(f"uid {uid}: {result}")
         if "status=" in result or "skipped" in result:
-            client.add_flags([uid], [b"\\Seen"])
+            try:
+                client.add_flags([uid], [b"\\Seen"])
+            except Exception as exc:
+                # Handled but not flagged: idempotency on /v1/events makes the
+                # inevitable re-read harmless.
+                results.append(f"uid {uid}: warning: could not mark seen: {exc}")
     return results
 
 

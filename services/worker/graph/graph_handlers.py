@@ -49,12 +49,19 @@ class RealHandlers(Handlers):
         return self._roles.get(logical, logical)
 
     def run_action(self, txn_id, action, data):
+        # NOTE the canonical action names. pdd_norm.canon_action() rewrites the
+        # PDD's "post_to_erp" / "post" / "post_to_system" to "post_to_record", so
+        # matching on "post_to_erp" here NEVER fired: the posting step silently did
+        # nothing and no ERP_POSTED event was ever written to the audit trail. Both
+        # spellings are accepted now.
         import invoice_activities as A
-        if action == "extract_fields":
+        if action in ("extract_fields", "extract"):
             return _run(A.extract_fields(txn_id)) or data
-        if action == "post_to_erp":
+        if action in ("post_to_record", "post_to_erp"):
             _run(A.post_to_erp(txn_id, data))
             return data
+        if action:
+            print(f"run_action: no built-in action named {action!r}; step did nothing")
         return data
 
     def decide(self, node, data, cfg, txn_id=None):

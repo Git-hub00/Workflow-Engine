@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# scripts/deploy_docker.sh — Dockerized deploy (replaces the systemd path in
-# scripts/deploy_vm.sh). Builds and starts the full stack — infra + app tier
+# scripts/deploy_docker.sh — THE deploy script (it replaced an older systemd
+# path, which has since been removed). Builds and starts the full stack — infra + app tier
 # (api, worker, adapter, migrate, web) — with Docker Compose. Idempotent: safe to
 # run repeatedly. Run on the VM (or from CI over SSH).
 #

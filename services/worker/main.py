@@ -31,13 +31,14 @@ from concurrent.futures import ThreadPoolExecutor
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-# Make the activities and workflows importable (they are plain modules under this
+# Make the activities and the engine importable (they are plain modules under this
 # worker/ tree, not installed packages) by adding their dirs to sys.path.
+# (There is no longer a `workflows/` dir: the old Temporal-only interpreter that
+#  lived there was replaced by graph/graph_orchestrator.py — LangGraph is the engine.)
 HERE = Path(__file__).resolve().parent
 ACTIVITIES_DIR = HERE / "activities"
-WORKFLOWS_DIR = HERE / "workflows"
 GRAPH_DIR = HERE / "graph"
-for d in (ACTIVITIES_DIR, WORKFLOWS_DIR, GRAPH_DIR):
+for d in (ACTIVITIES_DIR, GRAPH_DIR):
     if str(d) not in sys.path:
         sys.path.insert(0, str(d))
 

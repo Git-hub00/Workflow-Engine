@@ -4,21 +4,10 @@
 // process definition instead of hardcoding invoice, so ANY published process can
 // be launched from the catalog. Reuses the existing App.css classes for styling.
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { get, post, upload } from './api'
-
-// data_schema is {fieldName: "string"|"number"} in the PDD. Turn it into the
-// fields[] shape DynamicForm renders.
-function schemaToFields(dataSchema) {
-  if (!dataSchema || typeof dataSchema !== 'object') return []
-  return Object.entries(dataSchema).map(([key, type]) => ({
-    key,
-    type: type === 'number' ? 'number' : 'string',
-  }))
-}
+import { get } from './api'
 
 // Render a set of inputs from a fields spec: [{key, type, values?, required?}].
-// Shared by the Start form now and (slice 2) the task form.
-export function DynamicForm({ fields, values, onChange, disabled = false }) {
+function DynamicForm({ fields, values, onChange, disabled = false }) {
   return (
     <div className="config-field-grid three-columns">
       {fields.map((field) => (
@@ -157,7 +146,7 @@ function computeLayout(pdd) {
 //    wide, short graph fitted the width and left the bottom half of the box empty.
 //  * The wheel only zooms with SHIFT held; a plain wheel is left alone so the page
 //    scrolls normally.
-export function FlowDiagram({ pdd, height = 520, visited, taken, current, outcome, legend }) {
+export function FlowDiagram({ pdd, height = 520, visited, taken, inferred, current, outcome, legend }) {
   const layout = useMemo(
     () => (pdd && Array.isArray(pdd.nodes) && pdd.nodes.length ? computeLayout(pdd) : null),
     [pdd],
@@ -170,7 +159,11 @@ export function FlowDiagram({ pdd, height = 520, visited, taken, current, outcom
 
   const vSet = useMemo(() => new Set(visited || []), [visited])
   const tSet = useMemo(() => new Set(taken || []), [taken])
-  const highlighting = Boolean(visited || current)
+  const iSet = useMemo(() => new Set(inferred || []), [inferred])
+  // An EMPTY array is truthy, so `Boolean(visited)` switched highlighting on with
+  // nothing to highlight — every step rendered at 40% opacity with no coloured
+  // connections, which looks exactly like a broken render. Require real content.
+  const highlighting = Boolean((visited && visited.length) || current)
 
   // Keep the box's pixel size (so the graph can be scaled to fill it).
   useEffect(() => {
@@ -266,7 +259,17 @@ export function FlowDiagram({ pdd, height = 520, visited, taken, current, outcom
     return '#e2e8f0'
   }
   const nodeOpacity = (n) => (highlighting && !vSet.has(n.id) && n.id !== current ? 0.4 : 1)
-  const edgeOn = (a, b) => !highlighting || tSet.has(`${a}>${b}`)
+  // 'on'       = proven from the audit trail  -> solid bold blue
+  // 'inferred' = filled in to bridge a gap    -> DASHED blue, so a guessed hop is
+  //              never presented as fact
+  // 'off'      = not part of this run         -> faded grey
+  const edgeState = (a, b) => {
+    if (!highlighting) return 'on'
+    const key = `${a}>${b}`
+    if (tSet.has(key)) return 'on'
+    if (iSet.has(key)) return 'inferred'
+    return 'off'
+  }
 
   return (
     <div className="flow-canvas" ref={boxRef}
@@ -334,15 +337,17 @@ export function FlowDiagram({ pdd, height = 520, visited, taken, current, outcom
                 ly = (y1 + y2) / 2 - 5
               }
               const label = link.label && link.label.length > 18 ? `${link.label.slice(0, 17)}...` : link.label
-              const on = edgeOn(link.from, link.to)
+              const state = edgeState(link.from, link.to)
+              const lit = highlighting && state !== 'off'
               return (
-                <g key={`bld-e-${idx}`} opacity={on ? 1 : 0.3}>
-                  <path d={d} fill="none" stroke={on && highlighting ? '#2563eb' : '#94a3b8'}
-                        strokeWidth={on && highlighting ? 2.6 : 1.4}
-                        markerEnd={on && highlighting ? 'url(#bld-arrow-on)' : 'url(#bld-arrow)'} />
+                <g key={`bld-e-${idx}`} opacity={state === 'off' ? 0.3 : 1}>
+                  <path d={d} fill="none" stroke={lit ? '#2563eb' : '#94a3b8'}
+                        strokeWidth={lit ? 2.6 : 1.4}
+                        strokeDasharray={state === 'inferred' ? '6 4' : undefined}
+                        markerEnd={lit ? 'url(#bld-arrow-on)' : 'url(#bld-arrow)'} />
                   {label && (
                     <text x={lx} y={ly} textAnchor="middle" fontSize="10"
-                          fill={on && highlighting ? '#1d4ed8' : '#475569'}
+                          fill={lit ? '#1d4ed8' : '#475569'}
                           stroke="#ffffff" strokeWidth="3" paintOrder="stroke">{label}</text>
                   )}
                 </g>
@@ -394,22 +399,30 @@ export function ProcessFlowDynamic() {
   const [error, setError] = useState('')
 
   useEffect(() => {
+    let alive = true
     get('/v1/my-processes')
       .then((res) => {
+        if (!alive) return
         const list = (res && res.processes) || []
         setProcesses(list)
         setSelected((current) => current || list[0] || '')
       })
-      .catch((e) => setError(e.message || String(e)))
+      .catch((e) => { if (alive) setError(e.message || String(e)) })
+    return () => { alive = false }
   }, [])
 
+  // `alive` guard: switching chips quickly (or leaving the tab, which unmounts this
+  // view) could let an OLDER definition resolve last and be displayed under the
+  // newly highlighted chip, and set state after unmount.
   useEffect(() => {
-    if (!selected) return
+    if (!selected) return undefined
+    let alive = true
     setPdd(null)
     setError('')
     get(`/v1/definitions/${encodeURIComponent(selected)}`)
-      .then(setPdd)
-      .catch((e) => setError(e.message || String(e)))
+      .then((p) => { if (alive) setPdd(p) })
+      .catch((e) => { if (alive) setError(e.message || String(e)) })
+    return () => { alive = false }
   }, [selected])
 
   return (

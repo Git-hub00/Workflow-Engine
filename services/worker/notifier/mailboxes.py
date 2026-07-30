@@ -66,15 +66,23 @@ def get_mailbox(name=None):
 
 def all_mailboxes():
     """Every configured mailbox (default + all MAILBOX_<NAME>_*), de-duplicated by
-    address — used by the email adapter to poll each inbox for replies."""
+    address — used by the email adapter to poll each inbox for replies.
+
+    NAMED mailboxes are collected FIRST and always win over the legacy default.
+    WHY: a process is bound to a mailbox by NAME (pdd.mailbox), so if the same Gmail
+    address is configured both as GMAIL_ADDRESS and as MAILBOX_INVOICE_ADDRESS — a
+    very common state after migrating from the single-mailbox setup — keeping the
+    entry called "default" means _process_for_mailbox('default') matches no process
+    and EVERY incoming mail is skipped. Iteration order of os.environ made that
+    outcome random; now it is deterministic and correct."""
     boxes = {}
-    default = _default_mailbox()
-    if default:
-        boxes[default["address"]] = default
-    for env_key, value in os.environ.items():
+    for env_key, value in sorted(os.environ.items()):
         if env_key.startswith("MAILBOX_") and env_key.endswith("_ADDRESS") and value:
             name = env_key[len("MAILBOX_"):-len("_ADDRESS")]
             box = get_mailbox(name)
-            if box:
+            if box and box["address"] not in boxes:
                 boxes[box["address"]] = box
+    default = _default_mailbox()
+    if default and default["address"] not in boxes:
+        boxes[default["address"]] = default
     return list(boxes.values())

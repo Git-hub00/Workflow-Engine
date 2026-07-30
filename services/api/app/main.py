@@ -17,23 +17,22 @@ from pathlib import Path
 import jwt
 import requests
 from jwt import PyJWKClient
+from jwt.exceptions import PyJWKClientConnectionError, PyJWKClientError
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import bindparam, create_engine, text
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 from temporalio.client import Client
 from temporalio.service import RPCError
 
-# WHY sys.path manipulation here (unlike the workflow file): the API is a normal
-# process, NOT a Temporal workflow, so it is free to touch the filesystem and
-# adjust sys.path. We add the worker's `workflows` and `activities` dirs so we
-# can import InvoiceWorkflow (which in turn imports invoice_activities by bare
-# name). This file lives at services/api/app/main.py, so services/ is parents[2].
+# WHY sys.path manipulation: the API is a normal process, so it is free to adjust
+# sys.path. It adds the worker's `activities` dir so the quorum/task helpers can be
+# imported by bare module name. This file lives at services/api/app/main.py, so
+# services/ is parents[2].
 SERVICES_DIR = Path(__file__).resolve().parents[2]
-for _sub in ("workflows", "activities"):
-    _d = SERVICES_DIR / "worker" / _sub
-    if str(_d) not in sys.path:
-        sys.path.insert(0, str(_d))
+_ACTIVITIES_DIR = SERVICES_DIR / "worker" / "activities"
+if str(_ACTIVITIES_DIR) not in sys.path:
+    sys.path.insert(0, str(_ACTIVITIES_DIR))
 # scripts/ holds the shared PDD validator (also used by the CLI and seeds).
 _SCRIPTS_DIR = SERVICES_DIR.parent / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -50,7 +49,11 @@ from pdd_validation import validate_pdd  # noqa: E402  (structural PDD checks)
 # (systemd; defaults point at localhost) and inside a container (compose sets these
 # to Docker service names: postgres / temporal).
 DB_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://app:app@localhost:5432/workflow_app")
-engine = create_engine(DB_URL)
+# pool_pre_ping: without it, the FIRST request after a database restart (or after an
+# idle connection is reaped by the network) fails with a 500, because a dead pooled
+# connection is handed out and only discovered mid-statement. pool_pre_ping checks
+# the connection is alive and transparently replaces it instead.
+engine = create_engine(DB_URL, pool_pre_ping=True)
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
 
 
@@ -70,12 +73,21 @@ app = FastAPI(title="Workflow Engine API", lifespan=lifespan)
 # WHY CORS: the SPA is served from a different origin (http://localhost:5173) than
 # the API (http://localhost:8000). Browsers block cross-origin XHR/fetch unless the
 # API returns CORS headers, so we allow the SPA origin explicitly.
+#
+# Env-driven: the origin was hardcoded to localhost:5173, so ANY deployment where
+# the SPA is not same-origin (nginx proxying /api hides this; a direct API host does
+# not) failed with an opaque browser CORS error and an apparently dead UI. Set
+# CORS_ORIGINS to a comma-separated list of origins, or "*" to allow any.
 from fastapi.middleware.cors import CORSMiddleware
+
+_cors_env = os.getenv("CORS_ORIGINS", "http://localhost:5173").strip()
+_cors_origins = ["*"] if _cors_env == "*" else [o.strip() for o in _cors_env.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    # Credentials cannot be combined with a wildcard origin (the browser rejects it).
+    allow_credentials=_cors_origins != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -119,10 +131,11 @@ async def current_user(authorization: str | None = Header(default=None)) -> dict
     # verification and returns a fake admin holding every role, so flows can run
     # without minting real tokens.
     if os.getenv("AUTH_DISABLED") == "1":
-        return {
-            "username": "dev-admin",
-            "roles": ["vendor", "ap_manager", "finance", "process_author", "admin"],
-        }
+        # ops_admin was missing, so with auth disabled EVERY /v1/admin/* endpoint
+        # answered 403 "requires role 'ops_admin'" — the Admin UI was unusable in the
+        # very mode meant to bypass auth. _DEV_ALL_ROLES makes the per-task role gate
+        # pass for any workflow's role names too, not just the invoice ones.
+        return {"username": "dev-admin", "roles": _DEV_ALL_ROLES, "_dev_all_roles": True}
 
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="missing or malformed Authorization header")
@@ -146,22 +159,44 @@ async def current_user(authorization: str | None = Header(default=None)) -> dict
             leeway=60,
             options={"verify_aud": False},
         )
-    except Exception:
-        # Any failure (bad signature, expired, malformed) -> 401.
+    except PyJWKClientConnectionError as exc:
+        # Keycloak / JWKS UNREACHABLE is not a bad token. Reporting it as 401
+        # "invalid or expired token" made every user log out and re-login during a
+        # Keycloak restart — which also failed — and sent support hunting a token bug
+        # that did not exist. 503 says what is actually wrong.
+        raise HTTPException(status_code=503,
+                            detail=f"identity provider unavailable: {exc}") from exc
+    except PyJWKClientError:
+        # "Unable to find a signing key that matches …" — the JWKS was READ fine, the
+        # token simply does not belong to it (a rotated key, or another realm). That
+        # IS a bad token, so it must stay a 401 or the SPA never re-authenticates.
         raise HTTPException(status_code=401, detail="invalid or expired token")
+    except jwt.PyJWTError:
+        # A genuinely bad token (bad signature, expired, malformed) -> 401.
+        raise HTTPException(status_code=401, detail="invalid or expired token")
+    except Exception as exc:
+        # Network/DNS failures inside the JWKS fetch also mean "IdP unreachable".
+        raise HTTPException(status_code=503,
+                            detail=f"could not verify token: {exc}") from exc
 
     roles = claims.get("realm_access", {}).get("roles", []) or []
     return {"username": claims.get("preferred_username") or claims.get("sub"), "roles": roles}
 
 
+def _has_role(user: dict, role: str) -> bool:
+    """Role check that also honours the AUTH_DISABLED dev super-user."""
+    if not user:
+        return False
+    if user.get("_dev_all_roles"):
+        return True
+    return role in (user.get("roles") or [])
+
+
 def require_role(role: str):
     # Returns a FastAPI dependency that 403s unless the caller holds `role`. Handy
     # for whole-endpoint gating.
-    # NOTE (Section 10): publishing a definition version would be gated with
-    # Depends(require_role("process_author")) — but no publish endpoint exists yet,
-    # so this helper is provided for when one is added.
     async def _dep(user: dict = Depends(current_user)) -> dict:
-        if role not in user["roles"]:
+        if not _has_role(user, role):
             raise HTTPException(status_code=403, detail=f"requires role '{role}'")
         return user
 
@@ -191,30 +226,49 @@ def _validate_author_finance_config(config: dict) -> tuple[int, int, bool]:
     return required, capacity, reject_short_circuits
 
 
-def _validate_finance_completion(comp: dict) -> None:
+def _validate_finance_completion(comp: dict, node_id: str = "") -> None:
     """Validate a quorum NODE's completion (n / of / rejectShortCircuits). The
     guided Builder stores quorum on the node, and both engines read it from there,
-    so this is the correct place to check — NOT top-level config."""
+    so this is the correct place to check — NOT top-level config.
+
+    The message now names the STEP and the ACTUAL numbers: the old text ("expected
+    integers satisfying 1 <= n <= of") gave no clue which step or which values were
+    wrong, so a failing submission was very hard to diagnose."""
+    where = f"step '{node_id}': " if node_id else ""
     n = comp.get("n")
     of = comp.get("of")
     rsc = comp.get("rejectShortCircuits")
     ok_ints = (isinstance(n, int) and not isinstance(n, bool)
                and isinstance(of, int) and not isinstance(of, bool) and 1 <= n <= of)
     if not ok_ints:
-        raise HTTPException(status_code=422,
-                            detail="invalid quorum: expected integers satisfying 1 <= n <= of")
+        raise HTTPException(
+            status_code=422,
+            detail=(f"{where}invalid approval settings — needs {n!r} approval(s) out of "
+                    f"{of!r} approver(s). Both must be whole numbers with "
+                    "1 <= needed <= approvers. Fix it in the Builder and save again."))
     if not isinstance(rsc, bool):
-        raise HTTPException(status_code=422,
-                            detail="invalid quorum: rejectShortCircuits must be true/false")
+        raise HTTPException(
+            status_code=422,
+            detail=f"{where}'one rejection ends it' must be true or false (got {rsc!r})")
 
 
 CORE_APP_ROLES = ("ops_admin", "process_author")
 
+# Every role name any workflow could use is unknowable, so the AUTH_DISABLED dev
+# user is flagged with _dev_all_roles and _has_role() short-circuits for it. This
+# list is only what a token would literally contain, for display/debug.
+_DEV_ALL_ROLES = ["ops_admin", "process_author", "vendor", "ap_manager", "finance", "admin"]
+
 
 def _user_processes(username: str) -> list:
-    """Workflows this person takes part in (set by an admin). Fail-safe: if the
-    table is not migrated yet we return None meaning 'do not restrict', so a
-    pending migration can never lock everyone out of their inbox."""
+    """Workflows this person takes part in (set by an admin).
+
+    Returns None ONLY when the user_process table does not exist yet (migration not
+    run), so a pending migration can't lock everyone out of their inbox.
+    ANY OTHER database error is re-raised. It used to swallow every exception and
+    return None — and None means UNRESTRICTED — so a momentary connection blip or
+    statement timeout silently widened every business user's view to ALL workflows,
+    leaving nothing behind but a line on stdout."""
     try:
         with engine.connect() as conn:
             rows = conn.execute(
@@ -222,15 +276,21 @@ def _user_processes(username: str) -> list:
                 {"u": username},
             ).scalars().all()
         return list(rows)
-    except Exception as exc:
-        print(f"user_process lookup failed (not migrated yet?): {exc}")
+    except ProgrammingError as exc:
+        # UndefinedTable — the assignment table has not been created yet.
+        print(f"user_process table missing (migration not run?): {exc}")
         return None
 
 
 def _allowed_processes(user: dict | None):
     """None = unrestricted (admins, authors, or table missing).
-    []   = assigned to nothing -> sees nothing."""
+    []   = assigned to nothing -> sees nothing.
+    An UNKNOWN caller (no/failed token) gets [] — not None. Treating 'unknown' as
+    'unrestricted' meant an anonymous request, or a merely EXPIRED token, saw MORE
+    than a properly scoped user."""
     if not user:
+        return []
+    if user.get("_dev_all_roles"):
         return None
     roles = user.get("roles") or []
     if any(r in roles for r in CORE_APP_ROLES):
@@ -239,16 +299,70 @@ def _allowed_processes(user: dict | None):
 
 
 def _process_scope_sql(allowed, txn_col: str) -> str:
-    """SQL fragment limiting rows to the caller's assigned workflows."""
+    """SQL fragment limiting rows to the caller's assigned workflows.
+
+    Uses an expanding bind parameter (:scope_keys) instead of interpolating the
+    values into the SQL text — callers must pass the params from
+    _process_scope_params(). Hand-rolled quote escaping on a security predicate is
+    one refactor away from a scope BYPASS, so it is gone."""
     if allowed is None:
         return ""
     if not allowed:
         return " AND 1 = 0 "          # assigned to nothing -> sees nothing
-    keys = ", ".join("'" + str(k).replace("'", "''") + "'" for k in allowed)
     return (f" AND {txn_col} IN (SELECT tr.id FROM \"transaction\" tr "
             "JOIN definition_version dv ON dv.id = tr.definition_version_id "
             "JOIN process_definition pd ON pd.id = dv.definition_id "
-            f"WHERE pd.process_key IN ({keys})) ")
+            "WHERE pd.process_key IN :scope_keys) ")
+
+
+def _process_scope_params(allowed) -> dict:
+    """Bind values for the fragment above (empty when no filter is applied)."""
+    return {"scope_keys": tuple(allowed)} if allowed else {}
+
+
+def _scoped_text(sql: str, allowed):
+    """text() with :scope_keys marked as an expanding IN-list when it is present."""
+    stmt = text(sql)
+    if allowed:
+        stmt = stmt.bindparams(bindparam("scope_keys", expanding=True))
+    return stmt
+
+
+def _process_key_of(conn, txn_id: str):
+    """Which workflow a transaction belongs to (for write-side scope checks)."""
+    return conn.execute(
+        text('SELECT pd.process_key FROM "transaction" tr '
+             "JOIN definition_version dv ON dv.id = tr.definition_version_id "
+             "JOIN process_definition pd ON pd.id = dv.definition_id "
+             "WHERE tr.id = CAST(:id AS uuid)"),
+        {"id": str(txn_id)},
+    ).scalar_one_or_none()
+
+
+def _require_process_access(user: dict, txn_id: str) -> None:
+    """403 unless this person is assigned to the transaction's workflow.
+
+    The process scope was READ-ONLY: /v1/tasks hid other teams' tasks, but claim and
+    complete never checked, so anyone holding a generic role name like 'manager' who
+    obtained a token for another workflow's task could approve it."""
+    allowed = _allowed_processes(user)
+    if allowed is None:
+        return
+    with engine.connect() as conn:
+        process_key = _process_key_of(conn, txn_id)
+    if process_key is not None and process_key not in allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=f"you are not assigned to the workflow '{process_key}'")
+
+
+def _uuid_or_422(value: str, what: str = "id") -> str:
+    """Validate a uuid BEFORE it reaches Postgres. CAST('abc' AS uuid) raises a
+    DataError that surfaced as an opaque 500; a bad id is a client mistake (422)."""
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=422, detail=f"{what} is not a valid uuid")
 
 
 def _is_quorum_policy(policy) -> bool:
@@ -326,12 +440,18 @@ def _ensure_finance_slots(conn, task_id: str, capacity: int) -> None:
 # invoices. Resolves the user if a valid Bearer token is present; returns None
 # otherwise, so the endpoint stays usable without a token (unchanged for anon callers).
 async def _optional_user(authorization: str | None = Header(default=None)) -> dict | None:
+    # NO header -> anonymous (the email adapter). A header that IS present but fails
+    # verification is a REAL error and is reported: swallowing it turned an expired
+    # token into an anonymous caller, which used to mean "unrestricted" — a silent
+    # privilege ESCALATION every time somebody's session aged out.
+    #
+    # Header-less callers stay anonymous even under AUTH_DISABLED. Resolving them to
+    # the dev admin made create_transaction prefer that name over the adapter's
+    # submitted_by, so in dev mode every emailed request was attributed to 'dev-admin'
+    # and the real submitter could never be told about it.
     if not authorization:
         return None
-    try:
-        return await current_user(authorization)
-    except HTTPException:
-        return None
+    return await current_user(authorization)
 
 
 class TransactionIn(BaseModel):
@@ -390,7 +510,7 @@ async def create_transaction(body: TransactionIn, user: dict | None = Depends(_o
     for _node in pdd.get("nodes", []):
         _comp = _node.get("completion") or {}
         if _comp.get("mode") == "quorum":
-            _validate_finance_completion(_comp)
+            _validate_finance_completion(_comp, _node.get("id") or "")
 
     # 2. Create the transaction row in ONE transaction: new uuid, linked to the
     #    resolved definition_version, status 'running', snapshot = posted data.
@@ -420,14 +540,32 @@ async def create_transaction(body: TransactionIn, user: dict | None = Depends(_o
     # LangGraph is THE engine: GraphOrchestratorWorkflow turns this PDD into a
     # LangGraph graph and walks it, pausing at human steps while Temporal holds
     # the durable wait. Started BY NAME so the API needn't import langgraph.
-    await app.state.temporal.start_workflow(
-        "GraphOrchestratorWorkflow", args=[txn_id, pdd], id=txn_id, task_queue="invoice-tq")
+    try:
+        await app.state.temporal.start_workflow(
+            "GraphOrchestratorWorkflow", args=[txn_id, pdd], id=txn_id, task_queue="invoice-tq")
+    except Exception as exc:
+        # The row is already committed as 'running'. If the workflow could not be
+        # started (Temporal down, wrong task queue, oversized payload) the run would
+        # sit in the Monitor as a phantom 'running' transaction forever — no workflow,
+        # no task, and nothing in the product able to close it. Mark it failed and
+        # tell the caller honestly.
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text('UPDATE "transaction" SET status = \'failed\', '
+                         "closed_at = COALESCE(closed_at, now()) WHERE id = CAST(:i AS uuid)"),
+                    {"i": txn_id})
+        except Exception as cleanup_exc:
+            print(f"could not mark transaction {txn_id} failed: {cleanup_exc}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"could not start the workflow engine for this request: {exc}") from exc
 
     # 4. Hand the caller the id they use to track/act on this run.
     return {"transaction_id": txn_id}
 
 
-# WHY POST /v1/extract (and legacy alias /v1/extract-invoice): document-upload
+# WHY POST /v1/extract: document-upload
 # assist for ANY process. Reads the PDF text and asks the LLM to pull the fields
 # the process's PDD declares (extraction.fields, else data_schema keys). It NEVER
 # creates a transaction and NEVER 500s — on any failure it returns
@@ -448,15 +586,24 @@ def _pdd_extract_fields(process_key: str) -> list:
         data_schema = pdd.get("data_schema")
         if isinstance(data_schema, dict) and data_schema:
             return list(data_schema.keys())
-    return ["vendor", "amount", "poNumber", "costCenter", "taxId"]  # invoice default
+    # No fallback field list. It used to return the INVOICE field names for ANY
+    # workflow, so uploading a document to a leave or refund process asked the model
+    # for poNumber/taxId, got nulls, and autofilled nothing — looking like a broken
+    # extractor rather than a definition with no declared fields.
+    return []
 
 
 @app.post("/v1/extract")
-@app.post("/v1/extract-invoice")
 async def extract_document(file: UploadFile = File(...),
-                           process_key: str = Form("invoice_approval")):
+                           process_key: str = Form(...)):
+    # process_key is REQUIRED. It defaulted to "invoice_approval", so a client that
+    # omitted it silently extracted against the invoice definition.
     raw = await file.read()
     fields = _pdd_extract_fields(process_key)
+    if not fields:
+        return {"fields": {},
+                "error": f"the workflow '{process_key}' declares no fields to extract "
+                         "(add them in the Builder's Request details)"}
     # Blocking work (pypdf + LLM HTTP) runs on a thread so a slow model can NEVER
     # stall the API event loop for other requests.
     import asyncio
@@ -536,16 +683,103 @@ class EventIn(BaseModel):
 # there (durably, across restarts) until a SIGNAL arrives. This endpoint records
 # the inbound decision, then delivers that signal — which is what wakes the
 # workflow and lets it continue.
+def _release_idempotency_key(key: str) -> None:
+    """Un-claim an idempotency key after the SIGNAL failed.
+
+    The database commits (audit event + task marked done) BEFORE the signal is sent.
+    If the signal then fails for any reason other than 'workflow already finished',
+    the decision is recorded but the workflow is still parked — and because the key
+    was consumed, the client's retry answered 'duplicate-ignored', actively asserting
+    the work was done. The run became unresumable through the product. Releasing the
+    key makes the retry actually re-attempt the signal."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM idempotency_key WHERE key = :k"), {"k": key})
+    except Exception as exc:                       # best effort; never mask the real error
+        print(f"could not release idempotency key {key!r} after a failed signal: {exc}")
+
+
+def _internal_key_ok(x_internal_key: str | None) -> bool:
+    """True when the caller presented the configured backend service key.
+
+    The email adapter is a trusted backend process with no user token. Set
+    INTERNAL_API_KEY in services/api/.env (BOTH the API and the adapter load that
+    file) and anonymous decision posting stops being accepted."""
+    expected = os.getenv("INTERNAL_API_KEY")
+    return bool(expected) and x_internal_key == expected
+
+
 @app.post("/v1/events")
-async def ingest_event(evt: EventIn):
+async def ingest_event(evt: EventIn,
+                       user: dict | None = Depends(_optional_user),
+                       x_internal_key: str | None = Header(default=None)):
+    # AUTHORISATION. This endpoint marks a task done and signals the workflow to
+    # resume — i.e. it APPROVES things — but it used to accept any anonymous caller,
+    # so the per-task role gate on /v1/tasks/{token}/complete was bypassable by
+    # posting here instead. Now:
+    #   * a signed-in caller must hold the task's role AND be assigned to its
+    #     workflow (exactly like the complete endpoint), and
+    #   * a tokenless caller is only accepted while INTERNAL_API_KEY is unset, or
+    #     when it presents that key.
+    trusted = _internal_key_ok(x_internal_key)
+    if not trusted and user is None and os.getenv("INTERNAL_API_KEY"):
+        raise HTTPException(status_code=401,
+                            detail="this endpoint requires a user token or the internal service key")
     if evt.kind == "finance":
         raise HTTPException(
             status_code=400,
             detail="Finance decisions must use the task complete endpoint after claiming a participant slot",
         )
+    evt.transaction_id = _uuid_or_422(evt.transaction_id, "transaction_id")
+
+    # A human decision MUST actually say something. An empty/garbage payload used to
+    # latch the task done and wake the workflow with no decision at all, so the step
+    # was consumed and the run took whatever the default branch was — irreversibly,
+    # because the task was already closed.
+    decision = evt.payload.get("decision") if isinstance(evt.payload, dict) else None
+    if not isinstance(decision, str) or not decision.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="payload.decision is required (e.g. 'approve', 'reject' or 'resubmit')")
+
+    # Resolve the task ONCE: role/scope gate, quorum guard, and identity for the audit.
+    task_row = None
+    if evt.task_token is not None:
+        with engine.connect() as conn:
+            task_row = conn.execute(
+                text("SELECT transaction_id, node_id, assigned_role, completion_policy "
+                     "FROM task WHERE token = :token"),
+                {"token": evt.task_token},
+            ).mappings().first()
+        if task_row is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        if not trusted and user is not None:
+            role = task_row["assigned_role"]
+            if role is not None and not _has_role(user, role):
+                raise HTTPException(status_code=403, detail=f"requires role '{role}'")
+            _require_process_access(user, str(task_row["transaction_id"]))
+        # A MULTI-APPROVER step cannot be settled by a single decision. Closing it
+        # here left every participant slot unvoted and the workflow parked on its
+        # vote count FOREVER, with no task visible to anyone.
+        if _is_quorum_policy(task_row["completion_policy"]):
+            raise HTTPException(
+                status_code=409,
+                detail=(f"step '{task_row['node_id']}' needs a multi-approver vote — "
+                        "claim a slot and decide via /v1/tasks/{token}/complete"))
+
+    # The transaction must exist, else the event insert fails an FK and returns 500.
+    with engine.connect() as conn:
+        if conn.execute(text('SELECT 1 FROM "transaction" WHERE id = CAST(:i AS uuid)'),
+                        {"i": evt.transaction_id}).first() is None:
+            raise HTTPException(status_code=404,
+                                detail=f"transaction '{evt.transaction_id}' not found")
+
     # The audit event's type reflects what kind of decision this is.
     event_type = "FINANCE_VOTE" if evt.kind == "finance" else "HUMAN_DECISION"
     event_id = str(uuid.uuid4())
+    # Attribute the decision to the person who made it. "EventIngress" for everyone
+    # destroyed accountability for exactly the approvals that most need it.
+    actor = (user or {}).get("username") or ("email-adapter" if trusted else "EventIngress")
 
     # IDEMPOTENCY FIRST. In ONE transaction we (a) write the audit event, then
     # (b) claim the idempotency key by inserting (key, event_id). The PRIMARY KEY
@@ -573,7 +807,7 @@ async def ingest_event(evt: EventIn):
                     "txn": evt.transaction_id,
                     "type": event_type,
                     "payload": json.dumps(evt.payload),
-                    "actor": "EventIngress",
+                    "actor": actor,
                 },
             )
             # (b) claim the idempotency key (duplicate => IntegrityError here).
@@ -595,13 +829,16 @@ async def ingest_event(evt: EventIn):
             # changes NO row the task was ALREADY done (the OTHER channel won), so
             # we skip the signal below to avoid a double-apply.
             if evt.task_token is not None and evt.kind != "finance":
+                # claimed_by comes from the VERIFIED token, never from the request
+                # body — a caller could otherwise record the approval against
+                # somebody else's name.
                 updated = conn.execute(
                     text(
                         "UPDATE task SET status = 'done', "
                         "claimed_by = COALESCE(:claimed_by, claimed_by) "
                         "WHERE token = :token AND status <> 'done'"
                     ),
-                    {"claimed_by": evt.payload.get("claimed_by"), "token": evt.task_token},
+                    {"claimed_by": (user or {}).get("username"), "token": evt.task_token},
                 )
                 task_already_done = updated.rowcount == 0
     except IntegrityError:
@@ -618,10 +855,17 @@ async def ingest_event(evt: EventIn):
     # (d) Signal the durably-paused workflow to RESUME. The workflow id is the
     # transaction id (set when the run was started). finance votes go to the
     # finance_vote signal; everything else to human_decision.
+    #
+    # node_id travels with the payload so the workflow can ignore a decision that
+    # belongs to a step it has already moved past (see the correlation guard in
+    # graph_orchestrator.human_decision).
     handle = app.state.temporal.get_workflow_handle(evt.transaction_id)
     sig = "finance_vote" if evt.kind == "finance" else "human_decision"
+    signal_payload = dict(evt.payload)
+    if task_row is not None and task_row["node_id"]:
+        signal_payload.setdefault("node_id", task_row["node_id"])
     try:
-        await handle.signal(sig, evt.payload)
+        await handle.signal(sig, signal_payload)
     except RPCError as e:
         # A decision can legitimately arrive AFTER the workflow finished (late email reply,
         # retry, double-submit). The decision is already recorded in the event log above;
@@ -630,7 +874,11 @@ async def ingest_event(evt: EventIn):
         msg = str(e).lower()
         if "already completed" in msg or "not found" in msg:
             return {"status": "workflow-already-closed"}
+        _release_idempotency_key(evt.idempotency_key)
         raise   # any other RPC error is a real failure — surface it
+    except Exception:
+        _release_idempotency_key(evt.idempotency_key)
+        raise
 
     return {"status": "accepted"}
 
@@ -641,27 +889,39 @@ async def ingest_event(evt: EventIn):
 # approve/reject) and missing fields. Returns {"open_task": null} when none is open.
 @app.get("/v1/transactions/{txn_id}/open-task")
 async def transaction_open_task(txn_id: str):
+    txn_id = _uuid_or_422(txn_id, "transaction_id")
     with engine.connect() as conn:
-        row = conn.execute(
+        rows = conn.execute(
             text(
                 "SELECT token, node_id, assigned_role, completion_policy "
                 "FROM task WHERE transaction_id = CAST(:t AS uuid) AND status = 'open' "
-                "ORDER BY created_at DESC LIMIT 1"
+                "ORDER BY created_at DESC, node_id"
             ),
             {"t": txn_id},
-        ).mappings().first()
-    if row is None:
-        return {"open_task": None}
-    policy = row["completion_policy"] if isinstance(row["completion_policy"], dict) else {}
-    need = policy.get("need") if isinstance(policy.get("need"), list) else None
-    return {
-        "open_task": {
+        ).mappings().all()
+        process_key = _process_key_of(conn, txn_id)
+    if not rows:
+        return {"open_task": None, "open_tasks": []}
+
+    def _shape(row):
+        policy = row["completion_policy"] if isinstance(row["completion_policy"], dict) else {}
+        need = policy.get("need") if isinstance(policy.get("need"), list) else None
+        return {
             "token": row["token"],
             "node_id": row["node_id"],
             "assigned_role": row["assigned_role"],
             "need": need,
+            # is_quorum lets the email adapter refuse to settle a multi-approver step
+            # with a single reply (which used to hang the run permanently).
+            "is_quorum": _is_quorum_policy(row["completion_policy"]),
+            "process_key": process_key,
         }
-    }
+
+    shaped = [_shape(r) for r in rows]
+    # open_task keeps the original single-task shape for existing callers; open_tasks
+    # exposes ALL of them, because a parallel (fork) step can have several at once and
+    # answering with only the newest let an emailed reply close the wrong branch.
+    return {"open_task": shaped[0], "open_tasks": shaped}
 
 
 # ===========================================================================
@@ -688,16 +948,17 @@ async def list_tasks(
     allowed = _allowed_processes(user)
     with engine.connect() as conn:
         rows = conn.execute(
-            text(
+            _scoped_text(
                 "SELECT t.id, t.transaction_id, t.node_id, t.token, t.assigned_role, "
                 "       t.status, t.claimed_by, t.completion_policy, t.created_at "
                 "FROM task t "
                 "WHERE t.status = :status "
                 "AND (CAST(:role AS text) IS NULL OR t.assigned_role = CAST(:role AS text)) "
                 + _process_scope_sql(allowed, "t.transaction_id") +
-                " ORDER BY t.created_at"
+                " ORDER BY t.created_at",
+                allowed,
             ),
-            {"status": status, "role": role},
+            {"status": status, "role": role, **_process_scope_params(allowed)},
         ).mappings().all()
 
         result = []
@@ -804,8 +1065,12 @@ async def list_tasks(
 
 
 # WHY ClaimIn: who is taking ownership of the task.
+# claimed_by is IGNORED — ownership is always the verified token identity. It used to
+# be honoured, so a user could claim a task in somebody else's name and the inbox's
+# "owned by" column was caller-controlled. Kept optional so existing clients (the SPA
+# still sends it) do not break.
 class ClaimIn(BaseModel):
-    claimed_by: str
+    claimed_by: str | None = None
 
 
 # WHY POST /v1/tasks/{token}/claim: let a user grab a task so two people don't
@@ -818,12 +1083,18 @@ async def claim_task(token: str, body: ClaimIn, user: dict = Depends(current_use
     # atomic claim below, which reports 409.)
     with engine.connect() as conn:
         task_row = conn.execute(
-            text("SELECT assigned_role, node_id, completion_policy FROM task WHERE token = :token"),
+            text("SELECT assigned_role, node_id, transaction_id, completion_policy "
+                 "FROM task WHERE token = :token"),
             {"token": token},
         ).mappings().first()
     assigned_role = task_row["assigned_role"] if task_row is not None else None
-    if assigned_role is not None and assigned_role not in user["roles"]:
+    if assigned_role is not None and not _has_role(user, assigned_role):
         raise HTTPException(status_code=403, detail=f"requires role '{assigned_role}'")
+    # Process scope on the WRITE path too. Role names like 'manager' are shared
+    # between workflows, so the role gate alone let someone assigned to invoices
+    # claim a leave task if they got hold of its token.
+    if task_row is not None:
+        _require_process_access(user, str(task_row["transaction_id"]))
 
     if task_row is not None and _is_quorum_policy(task_row["completion_policy"]):
         with engine.begin() as conn:
@@ -893,6 +1164,7 @@ async def claim_task(token: str, body: ClaimIn, user: dict = Depends(current_use
     # the loser's WHERE matches nothing and RETURNING yields zero rows. This
     # guarantees "a claimed task can't be claimed twice" WITHOUT a read-then-write
     # gap that a separate SELECT + UPDATE would open.
+    who = user["username"]
     with engine.begin() as conn:
         row = conn.execute(
             text(
@@ -900,7 +1172,7 @@ async def claim_task(token: str, body: ClaimIn, user: dict = Depends(current_use
                 "WHERE token = :token AND status = 'open' "
                 "RETURNING id, token, claimed_by, status"
             ),
-            {"who": body.claimed_by, "token": token},
+            {"who": who, "token": token},
         ).mappings().first()
 
     if row is None:
@@ -910,7 +1182,7 @@ async def claim_task(token: str, body: ClaimIn, user: dict = Depends(current_use
             status_code=409,
             detail="task not open (already claimed or does not exist)",
         )
-    return {"status": "claimed", "token": token, "claimed_by": body.claimed_by}
+    return {"status": "claimed", "token": token, "claimed_by": who}
 
 
 # WHY CompleteIn: completing a task carries the decision payload plus the
@@ -953,9 +1225,20 @@ async def _complete_finance_task(token: str, body: CompleteIn, user: dict) -> di
                 {"token": token},
             ).mappings().first()
             if task_row is None:
-                raise HTTPException(status_code=404, detail="Finance task not found")
+                raise HTTPException(status_code=404, detail="Approval task not found")
+            # RE-CHECK the idempotency key now that we hold the task lock. The
+            # pre-check above is outside the lock, so two concurrent retries of the
+            # SAME request (a double-clicked Vote button) both passed it; the second
+            # then blocked here and failed with 409 "already decided" — telling the
+            # voter their successful vote had errored. Under the lock the first
+            # request's key is visible, so the retry is correctly a duplicate.
+            if conn.execute(
+                text("SELECT 1 FROM idempotency_key WHERE key = :key"),
+                {"key": body.idempotency_key},
+            ).first() is not None:
+                return {"status": "duplicate-ignored"}
             if task_row["status"] != "open":
-                raise HTTPException(status_code=409, detail="Finance task is no longer open")
+                raise HTTPException(status_code=409, detail="This approval step is no longer open")
 
             required, capacity, reject_short_circuits = _finance_policy_values(
                 task_row["completion_policy"]
@@ -1090,7 +1373,14 @@ async def _complete_finance_task(token: str, body: CompleteIn, user: dict) -> di
             if "already completed" in message or "not found" in message:
                 response["status"] = "workflow-already-closed"
             else:
+                _release_idempotency_key(body.idempotency_key)
                 raise
+        except Exception:
+            # Same reasoning as in ingest_event: the vote is committed but the
+            # workflow never woke up. Free the key so a retry can re-send the signal
+            # instead of being told it was a duplicate.
+            _release_idempotency_key(body.idempotency_key)
+            raise
     return response
 
 
@@ -1111,8 +1401,10 @@ async def complete_task(token: str, body: CompleteIn, user: dict = Depends(curre
 
     # Role gate (Section 10): the caller must hold this task's assigned_role.
     assigned_role = row["assigned_role"]
-    if assigned_role is not None and assigned_role not in user["roles"]:
+    if assigned_role is not None and not _has_role(user, assigned_role):
         raise HTTPException(status_code=403, detail=f"requires role '{assigned_role}'")
+    # …and be assigned to this task's workflow (shared role names, see claim_task).
+    _require_process_access(user, str(row["transaction_id"]))
 
     # Multi-approver (quorum) tasks take the voting path. Decided by the task's
     # policy so the step can be named anything, in any workflow.
@@ -1127,7 +1419,8 @@ async def complete_task(token: str, body: CompleteIn, user: dict = Depends(curre
         kind="human",
         payload=body.payload,
     )
-    return await ingest_event(evt)
+    # The gates above already ran, so pass the verified user straight through.
+    return await ingest_event(evt, user=user, x_internal_key=None)
 
 
 # ===========================================================================
@@ -1176,38 +1469,61 @@ async def put_config(process_key: str, body: ConfigIn, user: dict = Depends(requ
     # Validate the finance quorum only if this config actually carries one.
     if body.config.get("quorum") is not None:
         _validate_author_finance_config(body.config)
-    with engine.connect() as conn:
+
+    # Read AND write inside ONE transaction, holding the definition row lock, then
+    # publish a NEW immutable version.
+    #
+    # THREE bugs this fixes. The old code (a) UPDATEd the published
+    # definition_version row in place — the very row in-flight transactions are
+    # pinned to, so replaying an old run showed config that never applied to it, with
+    # no audit of who changed what; (b) read on one connection and wrote on another
+    # with no lock, so two concurrent edits lost one silently, and if a Builder save
+    # published a newer version in between, the write landed on the SUPERSEDED
+    # version and had no effect at all — while still answering {"status":"updated"};
+    # (c) never re-validated the merged definition.
+    with engine.begin() as conn:
         row = conn.execute(
             text(
-                "SELECT dv.id AS version_id, dv.pdd AS pdd FROM definition_version dv "
+                "SELECT dv.pdd AS pdd FROM definition_version dv "
                 "JOIN process_definition pd ON pd.id = dv.definition_id "
                 "WHERE pd.process_key = :pk AND dv.status = 'published' "
-                "ORDER BY dv.version DESC "
-                "LIMIT 1"
+                "ORDER BY dv.version DESC LIMIT 1 FOR UPDATE OF dv"
             ),
             {"pk": process_key},
         ).mappings().first()
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No published definition found for process_key '{process_key}'",
+            )
+        if not isinstance(row["pdd"], dict):
+            raise HTTPException(status_code=409,
+                                detail=f"the stored definition for '{process_key}' is not readable")
 
-    if row is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No published definition found for process_key '{process_key}'",
-        )
+        # Replace ONLY the "config" key; keep process_key, roles, nodes and the rest.
+        new_pdd = {**row["pdd"], "config": body.config}
+        errors = _quorum_errors(new_pdd)
+        if errors:
+            raise HTTPException(status_code=422, detail={"errors": errors})
 
-    # Replace ONLY the "config" key; keep process_key, version, roles, and any
-    # other pdd fields intact.
-    new_pdd = {**row["pdd"], "config": body.config}
-    with engine.begin() as conn:
+        new_version = _next_version_locked(conn, process_key)
+        new_pdd["version"] = new_version
         conn.execute(
-            text("UPDATE definition_version SET pdd = CAST(:pdd AS jsonb) WHERE id = CAST(:id AS uuid)"),
-            {"pdd": json.dumps(new_pdd), "id": str(row["version_id"])},
+            text("INSERT INTO definition_version "
+                 "(id, definition_id, version, pdd, status, published_at) "
+                 "VALUES (CAST(:id AS uuid), "
+                 "        (SELECT id FROM process_definition WHERE process_key = :pk), "
+                 "        :v, CAST(:pdd AS jsonb), 'published', now())"),
+            {"id": str(uuid.uuid4()), "pk": process_key, "v": new_version,
+             "pdd": json.dumps(new_pdd)},
         )
 
-    # WHY new transactions pick this up automatically: POST /v1/transactions reads
-    # cfg FRESH from the published pdd at start time, so the very next invoice runs
-    # with these new values (this mirrors the prototype's Config tab). In-flight
-    # workflows keep the cfg snapshot they were started with — only new runs change.
-    return {"status": "updated", "process_key": process_key, "config": body.config}
+    # New transactions pick this up automatically: POST /v1/transactions reads the
+    # LATEST published version at start time. In-flight workflows keep the version
+    # they were started with — which is exactly why we add a version instead of
+    # rewriting one.
+    return {"status": "updated", "process_key": process_key,
+            "version": new_version, "config": body.config}
 
 
 # ===========================================================================
@@ -1252,9 +1568,42 @@ def _keycloak_realm_roles() -> set | None:
         return None
 
 
+def _quorum_errors(pdd: dict) -> list:
+    """Design-time check of every multi-approver step.
+
+    WHY: nothing validated quorum settings at PUBLISH time — only
+    create_transaction did, at 422. So an author could save "2 of 1" (or a quorum
+    missing rejectShortCircuits), see a green "saved", and only discover it when
+    EVERY submission to that workflow was rejected with an error they had no UI path
+    to fix. Now it is caught at Save, naming the step and the numbers."""
+    errors = []
+    for node in (pdd.get("nodes") or []):
+        if not isinstance(node, dict):
+            continue
+        comp = node.get("completion")
+        if not isinstance(comp, dict) or comp.get("mode") != "quorum":
+            continue
+        nid = node.get("id") or "(unnamed step)"
+        n, of = comp.get("n"), comp.get("of")
+        ints = (isinstance(n, int) and not isinstance(n, bool)
+                and isinstance(of, int) and not isinstance(of, bool))
+        if not ints:
+            errors.append(f"step '{nid}': approvals needed and number of approvers "
+                          f"must both be whole numbers (got n={n!r}, of={of!r})")
+        elif n < 1:
+            errors.append(f"step '{nid}': needs at least 1 approval (got {n})")
+        elif n > of:
+            errors.append(f"step '{nid}': needs {n} approvals but only has {of} "
+                          f"approver(s) — a request could never be approved")
+        if not isinstance(comp.get("rejectShortCircuits"), bool):
+            errors.append(f"step '{nid}': 'one rejection ends it' must be true or false")
+    return errors
+
+
 def _check_pdd(pdd: dict) -> tuple[list, list]:
-    # Structural validation (shared validator) + Keycloak role-existence.
+    # Structural validation (shared validator) + quorum sanity + Keycloak roles.
     errors, warnings = validate_pdd(pdd)
+    errors.extend(_quorum_errors(pdd))
     roles_map = pdd.get("roles", {}) if isinstance(pdd.get("roles"), dict) else {}
     realm_roles = _keycloak_realm_roles()
     if realm_roles is None:
@@ -1269,10 +1618,42 @@ def _check_pdd(pdd: dict) -> tuple[list, list]:
 # Open, read-only list of realm role names so authors can PICK roles in the
 # Builder. Creating/deleting roles stays admin-only under /v1/admin/roles.
 @app.get("/v1/roles")
-async def list_roles():
+async def list_roles(user: dict = Depends(current_user)):
+    # Requires a token: every call performs a Keycloak MASTER-realm admin login, so
+    # while this was open an anonymous caller could enumerate all role names and
+    # hammer Keycloak's admin token endpoint.
     # Hide Keycloak's own built-in roles — they are not business roles and must
     # not be offered when assigning people to workflow steps.
     return sorted(r for r in (_keycloak_realm_roles() or []) if not _is_builtin_role(r))
+
+
+def _next_version_locked(conn, process_key: str) -> int:
+    """Reserve the next version number for this workflow, under a row lock.
+
+    The definition row is created if needed with ON CONFLICT DO NOTHING and then
+    SELECT ... FOR UPDATE, so concurrent first-publishes of the same process_key
+    cannot create TWO process_definition rows. That mattered: version numbers are
+    counted per definition_id, so both copies started at version 1 and every later
+    read ('latest published version') picked between two different workflows at
+    random, while the catalog's GROUP BY hid the duplication completely."""
+    conn.execute(
+        text("INSERT INTO process_definition (id, process_key) "
+             "VALUES (CAST(:id AS uuid), :pk) ON CONFLICT (process_key) DO NOTHING"),
+        {"id": str(uuid.uuid4()), "pk": process_key},
+    )
+    definition_id = conn.execute(
+        text("SELECT id FROM process_definition WHERE process_key = :pk FOR UPDATE"),
+        {"pk": process_key},
+    ).scalar_one_or_none()
+    if definition_id is None:
+        raise HTTPException(status_code=500,
+                            detail=f"could not create the definition for '{process_key}'")
+    max_version = conn.execute(
+        text("SELECT COALESCE(MAX(version), 0) FROM definition_version "
+             "WHERE definition_id = CAST(:d AS uuid)"),
+        {"d": str(definition_id)},
+    ).scalar_one()
+    return int(max_version) + 1
 
 
 class DefinitionIn(BaseModel):
@@ -1283,7 +1664,10 @@ class DefinitionIn(BaseModel):
 # WHY POST /v1/definitions/validate: dry-run the checks so an author sees errors
 # BEFORE publishing. Open (read-like); it writes nothing.
 @app.post("/v1/definitions/validate")
-async def validate_definition(body: DefinitionIn):
+async def validate_definition(body: DefinitionIn,
+                              user: dict = Depends(require_role("process_author"))):
+    # Same reasoning as /v1/roles: this performs a Keycloak admin login, and only an
+    # author has any reason to dry-run a definition.
     errors, warnings = _check_pdd(body.pdd)
     return {"valid": not errors, "errors": errors, "warnings": warnings}
 
@@ -1302,32 +1686,28 @@ async def create_definition(body: DefinitionIn, user: dict = Depends(require_rol
         raise HTTPException(status_code=400, detail={"errors": errors, "warnings": warnings})
 
     status = "published" if body.publish else "draft"
-    with engine.begin() as conn:
-        definition_id = conn.execute(
-            text("SELECT id FROM process_definition WHERE process_key = :pk"),
-            {"pk": process_key},
-        ).scalar_one_or_none()
-        if definition_id is None:
-            definition_id = uuid.uuid4()
+    try:
+        with engine.begin() as conn:
+            new_version = _next_version_locked(conn, process_key)
+            pdd_to_store = {**pdd, "version": new_version}  # stored version is authoritative
             conn.execute(
-                text("INSERT INTO process_definition (id, process_key) VALUES (CAST(:id AS uuid), :pk)"),
-                {"id": str(definition_id), "pk": process_key},
+                text("INSERT INTO definition_version "
+                     "(id, definition_id, version, pdd, status, published_at) "
+                     "VALUES (CAST(:id AS uuid), "
+                     "        (SELECT id FROM process_definition WHERE process_key = :pk), "
+                     "        :v, CAST(:pdd AS jsonb), :st, "
+                     "        CASE WHEN :st = 'published' THEN now() ELSE NULL END)"),
+                {"id": str(uuid.uuid4()), "pk": process_key, "v": new_version,
+                 "pdd": json.dumps(pdd_to_store), "st": status},
             )
-        max_version = conn.execute(
-            text("SELECT COALESCE(MAX(version), 0) FROM definition_version "
-                 "WHERE definition_id = CAST(:d AS uuid)"),
-            {"d": str(definition_id)},
-        ).scalar_one()
-        new_version = int(max_version) + 1
-        pdd_to_store = {**pdd, "version": new_version}  # keep the stored version authoritative
-        conn.execute(
-            text("INSERT INTO definition_version "
-                 "(id, definition_id, version, pdd, status, published_at) "
-                 "VALUES (CAST(:id AS uuid), CAST(:d AS uuid), :v, CAST(:pdd AS jsonb), :st, "
-                 "        CASE WHEN :st = 'published' THEN now() ELSE NULL END)"),
-            {"id": str(uuid.uuid4()), "d": str(definition_id), "v": new_version,
-             "pdd": json.dumps(pdd_to_store), "st": status},
-        )
+    except IntegrityError as exc:
+        # Two authors saving the same workflow at the same instant both computed the
+        # same next version number and collided on the unique (definition, version)
+        # constraint. That surfaced as a bare 500; say what happened instead.
+        raise HTTPException(
+            status_code=409,
+            detail="somebody else saved this workflow at the same moment — "
+                   "reload the Builder and save again") from exc
     return {"process_key": process_key, "version": new_version, "status": status, "warnings": warnings}
 
 
@@ -1413,7 +1793,12 @@ def _kc_admin():
 @app.get("/v1/admin/roles")
 async def admin_list_roles(user: dict = Depends(require_role("ops_admin"))):
     kc, realm, h = _kc_admin()
-    roles = requests.get(f"{kc}/admin/realms/{realm}/roles", headers=h, timeout=10).json()
+    roles = _kc_check(requests.get(f"{kc}/admin/realms/{realm}/roles", headers=h, timeout=10),
+                      "list roles").json()
+    # An error object would iterate as its KEYS and silently produce [] — the Admin UI
+    # then said "no roles exist" instead of reporting the failure.
+    if not isinstance(roles, list):
+        raise HTTPException(status_code=502, detail="Keycloak returned an unexpected role list")
     # Only real business roles — Keycloak's built-ins are noise in the Admin UI.
     return sorted(r["name"] for r in roles
                   if isinstance(r, dict) and r.get("name") and not _is_builtin_role(r["name"]))
@@ -1439,19 +1824,34 @@ async def admin_list_users(user: dict = Depends(require_role("ops_admin"))):
     out = []
     for u in (users if isinstance(users, list) else []):
         roles = []
+        roles_ok = True
         try:
             rm = requests.get(f"{kc}/admin/realms/{realm}/users/{u.get('id')}/role-mappings/realm",
-                              headers=h, timeout=10).json()
-            roles = [r["name"] for r in rm if isinstance(r, dict) and r.get("name")]
-        except Exception:
-            pass
+                              headers=h, timeout=10)
+            data = rm.json() if rm.status_code == 200 else None
+            if isinstance(data, list):
+                roles = [r["name"] for r in data if isinstance(r, dict) and r.get("name")]
+            else:
+                roles_ok = False
+        except Exception as exc:
+            roles_ok = False
+            print(f"admin: could not read roles for {u.get('username')!r}: {exc}")
+        # roles_ok tells the UI the list is UNKNOWN, not empty. Swallowing the error
+        # and returning [] was dangerous: the Admin UI loaded an empty role list, and
+        # saving any other field then submitted roles=[] — which removes EVERY realm
+        # role the person had. A silent privilege wipe caused by a transient error.
         out.append({"username": u.get("username"), "email": u.get("email"), "roles": roles,
+                    "roles_ok": roles_ok,
                     "processes": _user_processes(u.get("username") or "") or []})
     return out
 
 
 def _set_user_processes(username: str, processes: list | None) -> None:
-    """Replace this person's workflow assignments (admin-controlled)."""
+    """Replace this person's workflow assignments (admin-controlled).
+
+    Only a MISSING TABLE is tolerated (migration not run) — every other failure is
+    raised. Swallowing all of them meant the admin saw "updated", the assignments
+    were never stored, and the person's inbox stayed wrong with no clue why."""
     if processes is None:
         return
     keys = [str(p).strip() for p in processes if str(p).strip()]
@@ -1462,19 +1862,42 @@ def _set_user_processes(username: str, processes: list | None) -> None:
                 conn.execute(
                     text("INSERT INTO user_process (username, process_key) VALUES (:u, :p)"),
                     {"u": username, "p": key})
+    except ProgrammingError as exc:
+        print(f"user_process table missing; assignments for {username!r} not stored: {exc}")
     except Exception as exc:
-        # Never fail user creation because assignments could not be stored (e.g.
-        # the migration has not run yet) — the account itself is still valid.
-        print(f"could not save workflow assignments for {username!r}: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"the account was saved but its workflow assignments were not: {exc}") from exc
 
 
 CORE_ROLES = {"ops_admin", "process_author"}
 
 
+def _kc_check(resp, what: str):
+    """Raise 502 with Keycloak's own message when an admin call fails.
+
+    None of these calls used to be checked, so admin_update_user answered
+    {"status": "updated"} even when Keycloak rejected the password policy, the
+    duplicate username, or the whole request."""
+    if resp.status_code >= 400:
+        try:
+            body = resp.json()
+            detail = body.get("errorMessage") or body.get("error") or str(body)
+        except Exception:
+            detail = (resp.text or "").strip()[:200]
+        raise HTTPException(status_code=502,
+                            detail=f"{what} failed: Keycloak said {resp.status_code} {detail}")
+    return resp
+
+
 def _kc_user_id(kc, realm, h, username):
     found = requests.get(f"{kc}/admin/realms/{realm}/users", headers=h,
                          params={"username": username, "exact": "true"}, timeout=10).json()
-    return found[0]["id"] if found else None
+    # isinstance guard: on an error Keycloak returns an OBJECT, and found[0] then
+    # raised KeyError: 0 -> an opaque 500 during user update/delete.
+    if isinstance(found, list) and found and isinstance(found[0], dict):
+        return found[0].get("id")
+    return None
 
 
 @app.delete("/v1/admin/roles/{name}")
@@ -1516,7 +1939,11 @@ async def admin_update_user(username: str, body: UserUpdate, user: dict = Depend
     uid = _kc_user_id(kc, realm, h, username)
     if not uid:
         raise HTTPException(status_code=404, detail=f"user '{username}' not found")
-    rep = requests.get(f"{kc}/admin/realms/{realm}/users/{uid}", headers=h, timeout=10).json()
+    rep_resp = _kc_check(requests.get(f"{kc}/admin/realms/{realm}/users/{uid}",
+                                      headers=h, timeout=10), "read user")
+    rep = rep_resp.json()
+    if not isinstance(rep, dict):
+        raise HTTPException(status_code=502, detail="Keycloak returned an unexpected user record")
     changed = False
     if body.email is not None:
         rep["email"] = body.email
@@ -1526,27 +1953,50 @@ async def admin_update_user(username: str, body: UserUpdate, user: dict = Depend
         rep["username"] = body.new_username
         changed = True
     if changed:
-        requests.put(f"{kc}/admin/realms/{realm}/users/{uid}", headers=h, json=rep, timeout=10)
+        _kc_check(requests.put(f"{kc}/admin/realms/{realm}/users/{uid}", headers=h,
+                               json=rep, timeout=10), "update user")
     if body.password:
-        requests.put(f"{kc}/admin/realms/{realm}/users/{uid}/reset-password", headers=h,
-                     json={"type": "password", "value": body.password, "temporary": False}, timeout=10)
+        _kc_check(requests.put(
+            f"{kc}/admin/realms/{realm}/users/{uid}/reset-password", headers=h,
+            json={"type": "password", "value": body.password, "temporary": False},
+            timeout=10), "set password")
     if body.roles is not None:
-        current = requests.get(f"{kc}/admin/realms/{realm}/users/{uid}/role-mappings/realm", headers=h, timeout=10).json()
+        cur_resp = _kc_check(requests.get(
+            f"{kc}/admin/realms/{realm}/users/{uid}/role-mappings/realm",
+            headers=h, timeout=10), "read current roles")
+        current = cur_resp.json()
+        # If the CURRENT roles cannot be read we must NOT proceed: `to_remove` would
+        # be empty and `to_add` complete, or worse the caller's empty list would look
+        # like "remove everything" against an unknown baseline.
+        if not isinstance(current, list):
+            raise HTTPException(status_code=502,
+                                detail="could not read this user's current roles; nothing was changed")
         current = [r for r in current if isinstance(r, dict) and r.get("name")]
         want = set(body.roles)
         to_remove = [r for r in current if r["name"] not in want]
         if to_remove:
-            requests.delete(f"{kc}/admin/realms/{realm}/users/{uid}/role-mappings/realm",
-                            headers=h, json=to_remove, timeout=10)
+            _kc_check(requests.delete(
+                f"{kc}/admin/realms/{realm}/users/{uid}/role-mappings/realm",
+                headers=h, json=to_remove, timeout=10), "remove roles")
         have = {r["name"] for r in current}
         to_add = []
+        missing_roles = []
         for role in want - have:
             rr = requests.get(f"{kc}/admin/realms/{realm}/roles/{role}", headers=h, timeout=10)
             if rr.status_code == 200:
                 to_add.append({"id": rr.json()["id"], "name": role})
+            else:
+                missing_roles.append(role)
+        if missing_roles:
+            # Silently dropping unknown roles left the admin believing they were
+            # granted; the user then hit 403s nobody could explain.
+            raise HTTPException(
+                status_code=400,
+                detail=f"these roles do not exist in Keycloak: {', '.join(sorted(missing_roles))}")
         if to_add:
-            requests.post(f"{kc}/admin/realms/{realm}/users/{uid}/role-mappings/realm",
-                          headers=h, json=to_add, timeout=10)
+            _kc_check(requests.post(
+                f"{kc}/admin/realms/{realm}/users/{uid}/role-mappings/realm",
+                headers=h, json=to_add, timeout=10), "add roles")
     # Workflow assignments follow a rename so the person keeps their inbox.
     final_username = body.new_username or username
     if body.new_username and body.new_username != username:
@@ -1602,17 +2052,26 @@ async def admin_create_user(body: UserIn, user: dict = Depends(require_role("ops
             status_code=400 if created.status_code in (400, 409) else 502,
             detail=f"Could not create user '{body.username}': "
                    f"Keycloak said {created.status_code} {reason or 'no detail'}{hint}")
-    requests.put(f"{kc}/admin/realms/{realm}/users/{uid}/reset-password", headers=h,
-                 json={"type": "password", "value": body.password, "temporary": False}, timeout=10)
+    _kc_check(requests.put(
+        f"{kc}/admin/realms/{realm}/users/{uid}/reset-password", headers=h,
+        json={"type": "password", "value": body.password, "temporary": False},
+        timeout=10), "set password")
     assign = []
+    missing_roles = []
     for role in body.roles:
         rr = requests.get(f"{kc}/admin/realms/{realm}/roles/{role}", headers=h, timeout=10)
         if rr.status_code == 200:
             assign.append({"id": rr.json()["id"], "name": role})
+        else:
+            missing_roles.append(role)
     if assign:
-        requests.post(f"{kc}/admin/realms/{realm}/users/{uid}/role-mappings/realm", headers=h, json=assign, timeout=10)
+        _kc_check(requests.post(f"{kc}/admin/realms/{realm}/users/{uid}/role-mappings/realm",
+                                headers=h, json=assign, timeout=10), "assign roles")
     _set_user_processes(body.username, body.processes)
     return {"username": body.username, "roles_assigned": [a["name"] for a in assign],
+            # Reported rather than silently dropped, so the admin knows the account
+            # exists but is missing a role they asked for.
+            "roles_not_found": missing_roles,
             "processes": body.processes}
 
 
@@ -1627,9 +2086,10 @@ async def admin_create_user(body: UserIn, user: dict = Depends(require_role("ops
 # the Monitor's KPI boxes reflect the full dataset, not just the current page.
 @app.get("/v1/transactions/stats")
 async def transaction_stats(process_key: str | None = None,
-                            user: dict | None = Depends(_optional_user)):
+                            user: dict = Depends(current_user)):
     # Counts for ONE workflow when process_key is given, else across all the
-    # workflows this person is allowed to see.
+    # workflows this person is allowed to see. Requires a token: an anonymous caller
+    # used to be treated as "unrestricted" and got totals across every workflow.
     clauses = []
     params: dict = {}
     if process_key:
@@ -1637,21 +2097,31 @@ async def transaction_stats(process_key: str | None = None,
                        "JOIN process_definition pd ON pd.id = dv.definition_id "
                        "WHERE pd.process_key = :pk)")
         params["pk"] = process_key
-    scope = _process_scope_sql(_allowed_processes(user), "tr.id").strip()
+    allowed = _allowed_processes(user)
+    scope = _process_scope_sql(allowed, "tr.id").strip()
     if scope:
         clauses.append(scope[4:] if scope.startswith("AND ") else scope)
+        params.update(_process_scope_params(allowed))
     where = (" WHERE " + " AND ".join(clauses) + " ") if clauses else ""
     with engine.connect() as conn:
         rows = conn.execute(
-            text(f'SELECT tr.status AS status, count(*) AS n FROM "transaction" tr{where} '
-                 "GROUP BY tr.status"), params
+            _scoped_text(
+                f'SELECT tr.status AS status, count(*) AS n FROM "transaction" tr{where} '
+                "GROUP BY tr.status", allowed if scope else None),
+            params,
         ).mappings().all()
     counts = {r["status"]: r["n"] for r in rows}
+    known = ("running", "approved", "rejected")
     return {
         "total": sum(counts.values()),
         "running": counts.get("running", 0),
         "approved": counts.get("approved", 0),
         "rejected": counts.get("rejected", 0),
+        # Workflows may end in any outcome the author names (paid, declined,
+        # completed…), and a failed start is 'failed'. Without these the KPI boxes
+        # simply did not add up to the total, with nowhere for the rest to go.
+        "other": sum(n for s, n in counts.items() if s not in known),
+        "by_status": counts,
     }
 
 
@@ -1661,34 +2131,52 @@ async def transaction_stats(process_key: str | None = None,
 # pagination + KPI filtering.
 @app.get("/v1/transactions")
 async def list_transactions(status: str | None = None, limit: int = 100, offset: int = 0,
-                            process_key: str | None = None,
-                            user: dict | None = Depends(_optional_user)):
+                            process_key: str | None = None, ids: str | None = None,
+                            user: dict = Depends(current_user)):
     # process_key gives each workflow its OWN monitor view (generic — the value
     # comes from whatever workflows exist, nothing is hardcoded). Rows are ALSO
-    # limited to the workflows this person is assigned to, so a business user can
-    # no longer see another team's runs. Admins/authors see everything, and an
-    # unauthenticated caller is left unrestricted for backward compatibility.
-    limit = max(1, min(int(limit), 100))
+    # limited to the workflows this person is assigned to, so a business user cannot
+    # see another team's runs. Admins/authors see everything.
+    #
+    # Requires a token now. Anonymous callers used to be "unrestricted" and could
+    # read every workflow's runs INCLUDING each data_snapshot. The email adapter does
+    # not use this endpoint (it only POSTs transactions), so nothing else is affected.
+    #
+    # `ids` (comma-separated) fetches specific transactions regardless of recency, so
+    # the Task Inbox can resolve a long-pending task's request instead of hoping it is
+    # still inside the newest 100 rows.
+    limit = max(1, min(int(limit), 200))
     offset = max(0, int(offset))
-    scope_sql = _process_scope_sql(_allowed_processes(user), "tr.id")
+    allowed = _allowed_processes(user)
+    scope_sql = _process_scope_sql(allowed, "tr.id")
+    id_list = []
+    if ids:
+        id_list = [_uuid_or_422(i.strip(), "ids") for i in ids.split(",") if i.strip()][:200]
+    id_sql = " AND tr.id IN :want_ids " if id_list else ""
+    stmt_sql = (
+        "SELECT tr.id, pd.process_key, tr.definition_version_id, "
+        "       dv.version AS definition_version, tr.status, tr.data_snapshot, "
+        "       tr.submitted_by, "
+        "       tr.created_at, tr.closed_at, "
+        "       COALESCE(tr.temporal_workflow_id, CAST(tr.id AS text)) AS temporal_workflow_id, "
+        "       tr.temporal_run_id "
+        'FROM "transaction" tr '
+        "LEFT JOIN definition_version dv ON dv.id = tr.definition_version_id "
+        "LEFT JOIN process_definition pd ON pd.id = dv.definition_id "
+        "WHERE (CAST(:status AS text) IS NULL OR tr.status = CAST(:status AS text)) "
+        "AND (CAST(:pk AS text) IS NULL OR pd.process_key = CAST(:pk AS text)) "
+        + scope_sql + id_sql +
+        "ORDER BY tr.created_at DESC, tr.id DESC LIMIT :limit OFFSET :offset"
+    )
+    stmt = _scoped_text(stmt_sql, allowed)
+    if id_list:
+        stmt = stmt.bindparams(bindparam("want_ids", expanding=True))
     with engine.connect() as conn:
         rows = conn.execute(
-            text(
-                "SELECT tr.id, pd.process_key, tr.definition_version_id, "
-                "       dv.version AS definition_version, tr.status, tr.data_snapshot, "
-                "       tr.submitted_by, "
-                "       tr.created_at, tr.closed_at, "
-                "       COALESCE(tr.temporal_workflow_id, CAST(tr.id AS text)) AS temporal_workflow_id, "
-                "       tr.temporal_run_id "
-                'FROM "transaction" tr '
-                "LEFT JOIN definition_version dv ON dv.id = tr.definition_version_id "
-                "LEFT JOIN process_definition pd ON pd.id = dv.definition_id "
-                "WHERE (CAST(:status AS text) IS NULL OR tr.status = CAST(:status AS text)) "
-                "AND (CAST(:pk AS text) IS NULL OR pd.process_key = CAST(:pk AS text)) "
-                + scope_sql +
-                "ORDER BY tr.created_at DESC, tr.id DESC LIMIT :limit OFFSET :offset"
-            ),
-            {"status": status, "pk": process_key, "limit": limit, "offset": offset},
+            stmt,
+            {"status": status, "pk": process_key, "limit": limit, "offset": offset,
+             **_process_scope_params(allowed),
+             **({"want_ids": tuple(id_list)} if id_list else {})},
         ).mappings().all()
     # Stringify uuid/timestamp so the payload is JSON-serializable; data_snapshot
     # is jsonb and already deserializes to a dict.
@@ -1716,7 +2204,14 @@ async def list_transactions(status: str | None = None, limit: int = 100, offset:
 # in order — the timeline a monitor UI shows (started -> LLM decision -> task ->
 # notify -> ... -> outcome).
 @app.get("/v1/transactions/{txn_id}/history")
-async def transaction_history(txn_id: str, format: str | None = None):
+async def transaction_history(txn_id: str, format: str | None = None,
+                              user: dict = Depends(current_user)):
+    # The audit log is the most sensitive read in the API — every decision, every
+    # rejection reason, every vote and the full request data. It had NO auth and NO
+    # scope check at all, so anyone who knew (or guessed from the open list endpoint)
+    # a transaction id could replay another team's approvals.
+    txn_id = _uuid_or_422(txn_id, "transaction_id")
+    _require_process_access(user, txn_id)
     with engine.connect() as conn:
         # 404 rather than returning an empty list for a txn that doesn't exist.
         exists = conn.execute(
@@ -1779,40 +2274,60 @@ _NARRATIVE_CACHE: dict = {}
 
 def _fallback_sentence(event: dict) -> str:
     # Deterministic, code-built plain-English sentence for one audit event.
+    #
+    # WORDING IS WORKFLOW-NEUTRAL. It used to say "invoice", "vendor", "finance
+    # member" and "ERP system" for EVERY process, so a leave request's or a refund's
+    # audit trail read as somebody else's invoice story.
+    # It also never raises: these sentences are built OUTSIDE the try/except that
+    # guards the LLM pass, so a payload whose "data" was a list (not a dict), or a
+    # missing-fields list holding non-strings, made the whole narrative endpoint 500
+    # while the plain history worked fine.
     etype = event.get("type")
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-    if etype == "WORKFLOW_RUNNING":
-        return "The invoice workflow started."
-    if etype == "LLM_DECISION":
-        route = _ROUTE_TEXT.get(payload.get("route"), payload.get("route") or "review")
-        missing = payload.get("missing") or []
-        extra = f" (missing: {', '.join(missing)})" if missing else ""
-        return f"The AI reviewed the invoice and routed it to {route}{extra}."
-    if etype == "TASK_CREATED":
-        role = payload.get("role") or "a user"
-        node = payload.get("node_id") or "a step"
-        return f"A human task for role '{role}' was created at the '{node}' step."
-    if etype == "NOTIFY":
-        recipient = payload.get("recipient")
-        base = "A notification email was sent" + (f" to {recipient}" if recipient else "")
-        reason = payload.get("reason")
-        detail = event.get("detail") or ""
-        what = detail.split(":", 1)[1].strip() if ":" in detail else detail
-        return f"{base}: {what}." + (f" Reason: {reason}." if reason else "")
-    if etype == "HUMAN_DECISION":
-        decision = payload.get("decision")
-        if decision == "resubmit":
-            fields = ", ".join((payload.get("data") or {}).keys()) or "the requested details"
-            return f"The vendor supplied the requested information ({fields})."
-        reason = payload.get("reason")
-        return f"A reviewer decided to {decision or 'act'}." + (f" Reason: {reason}." if reason else "")
-    if etype == "FINANCE_VOTE":
-        who = payload.get("participant") or "A finance member"
-        decision = payload.get("decision") or "vote"
-        reason = payload.get("reason")
-        return f"Finance member {who} voted to {decision}." + (f" Reason: {reason}." if reason else "")
-    if etype == "ERP_POSTED":
-        return "The approved invoice was posted to the ERP system."
+
+    def _names(value) -> list:
+        if isinstance(value, dict):
+            return [str(k) for k in value.keys()]
+        if isinstance(value, (list, tuple, set)):
+            return [str(v) for v in value]
+        return [str(value)] if value not in (None, "") else []
+
+    try:
+        if etype == "WORKFLOW_RUNNING":
+            return "The request was received and the workflow started."
+        if etype == "LLM_DECISION":
+            route = _ROUTE_TEXT.get(payload.get("route"), payload.get("route") or "review")
+            missing = _names(payload.get("missing"))
+            extra = f" (still needed: {', '.join(missing)})" if missing else ""
+            return f"The request was assessed and routed to {route}{extra}."
+        if etype == "TASK_CREATED":
+            role = payload.get("role") or "a user"
+            node = payload.get("node_id") or "a step"
+            return f"A task for role '{role}' was created at the '{node}' step."
+        if etype == "NOTIFY":
+            recipients = _names(payload.get("recipients") or payload.get("recipient"))
+            base = "A notification email was sent" + (f" to {', '.join(recipients)}" if recipients else "")
+            reason = payload.get("reason")
+            detail = event.get("detail") or ""
+            what = detail.split(":", 1)[1].strip() if ":" in detail else detail
+            return f"{base}: {what}." + (f" Reason: {reason}." if reason else "")
+        if etype == "HUMAN_DECISION":
+            decision = payload.get("decision")
+            if decision == "resubmit":
+                fields = ", ".join(_names(payload.get("data"))) or "the requested details"
+                return f"The requester supplied the information asked for ({fields})."
+            reason = payload.get("reason")
+            return (f"A reviewer decided to {decision or 'act'}."
+                    + (f" Reason: {reason}." if reason else ""))
+        if etype == "FINANCE_VOTE":
+            who = payload.get("participant") or "An approver"
+            decision = payload.get("decision") or "vote"
+            reason = payload.get("reason")
+            return f"Approver {who} voted to {decision}." + (f" Reason: {reason}." if reason else "")
+        if etype == "ERP_POSTED":
+            return "The approved request was posted to the system of record."
+    except Exception as exc:                # never break the whole narrative
+        return f"{etype or 'An'} event was recorded (details unreadable: {exc})."
     return f"{etype or 'An'} event was recorded."
 
 

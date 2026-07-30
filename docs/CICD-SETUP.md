@@ -2,8 +2,9 @@
 
 The pipeline SSHes into the VM on every push to **`LangGraph-1`** (or a manual
 run), pulls the repo, writes `services/api/.env` from GitHub secrets/variables,
-and runs the idempotent `scripts/deploy_vm.sh` (infra → migrations → seeds →
-systemd services → SPA build → nginx).
+and runs the idempotent `scripts/deploy_docker.sh` (build images → infra →
+migrations → seeds → app containers → health check). Everything runs in Docker;
+see [DOCKER-DEPLOY.md](DOCKER-DEPLOY.md) for the container layout.
 
 ## 1. One-time manual clone on the VM (required)
 
@@ -70,40 +71,34 @@ proxied under `/auth/` because a path prefix requires
 `KC_HTTP_RELATIVE_PATH=/auth`, which would break the API's server-side JWKS URL
 (`http://localhost:8081/realms/…`), the admin-REST paths, and the login page's
 `/resources/` links. The API does not verify the token issuer, so direct access
-is fully compatible. `deploy/nginx.conf` keeps a commented `/auth/` block for
-teams that later enable KC relative-path mode.
+is fully compatible. The web container's nginx config is
+`deploy/docker/web-nginx.conf`.
 
 ## 5. Checking logs / health on the VM
 
 ```bash
-# app services
-systemctl status workflow-api workflow-worker workflow-adapter
-journalctl -u workflow-api -f
-journalctl -u workflow-worker -n 200 --no-pager
-journalctl -u workflow-adapter -f
+cd ~/LangGraph_Durable_Workflow_Engine
+
+# app containers (api, worker, adapter, web)
+docker compose -f docker-compose.dev.yml -f docker-compose.app.yml ps
+docker compose -f docker-compose.dev.yml -f docker-compose.app.yml logs -f api
+docker compose -f docker-compose.dev.yml -f docker-compose.app.yml logs -n 200 worker
+docker compose -f docker-compose.dev.yml -f docker-compose.app.yml logs -f adapter
 
 # infra
-cd ~/LangGraph_Durable_Workflow_Engine
-docker compose -f docker-compose.dev.yml ps
 docker compose -f docker-compose.dev.yml logs -f keycloak
 
-# nginx
-sudo nginx -t
-sudo systemctl status nginx
-sudo tail -f /var/log/nginx/error.log
-
 # quick smoke
-curl -s localhost:8000/health
+curl -s localhost/api/health          # through the web container's nginx
 curl -s -o /dev/null -w '%{http_code}\n' localhost:8081/realms/master
-curl -s localhost/api/health          # through nginx
 ```
 
 ## 6. Re-running / idempotency
 
-`scripts/deploy_vm.sh` is safe to run by hand at any time:
+`scripts/deploy_docker.sh` is safe to run by hand at any time:
 
 ```bash
-cd ~/LangGraph_Durable_Workflow_Engine && VM_HOST=<host> bash scripts/deploy_vm.sh
+cd ~/LangGraph_Durable_Workflow_Engine && VM_HOST=<host> bash scripts/deploy_docker.sh
 ```
 
 Seeds are check-then-create (PDD upsert; Keycloak realm/client/roles/users),

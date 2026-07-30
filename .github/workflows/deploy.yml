@@ -3,7 +3,8 @@
 # Trigger: every push to LangGraph-1, plus a manual "Run workflow" button.
 # The job SSHes to the VM, refreshes the checkout, writes services/api/.env from
 # GitHub secrets/variables (NEVER committed, never echoed), and runs the
-# idempotent scripts/deploy_vm.sh which brings up infra + app + nginx.
+# idempotent scripts/deploy_docker.sh which brings up infra + the app containers
+# (api, worker, adapter, web) with Docker Compose.
 #
 # REPO-CLONE DECISION: the VM must already have the repo cloned ONCE manually
 # (private repo, no GitHub token stored on the VM). The pipeline only pulls. If

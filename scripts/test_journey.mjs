@@ -66,12 +66,51 @@ j = deriveJourney(INVOICE, [
 ], 'approved')
 ok(['extract','review','manager','afterManager','finance','finalize','end_approved'].every((n) => j.visited.includes(n)),
    'case2: full path visited through finance to end_approved')
-ok(j.taken.includes('review>manager') && j.taken.includes('afterManager>finance') && j.taken.includes('finance>finalize'),
-   'case2: manager + finance branch edges highlighted')
+ok(j.taken.includes('review>manager') && j.taken.includes('afterManager>finance'),
+   'case2: decision branches are PROVEN from the recorded routes (solid)')
+// The manager's branch is proven too: a HUMAN_DECISION 'approve' is recorded, so it
+// resolves through the "decision == 'approve'" edge rather than being guessed.
+ok(j.taken.includes('manager>afterManager'), 'case2: manager approve branch proven from its decision')
+// Only ONE finance vote is recorded here but the step needs two, so the quorum's own
+// branch cannot be PROVEN from the audit trail. It is reported as inferred (drawn
+// dashed) instead of being presented as fact — that is the intended behaviour.
+ok(j.inferred.includes('finance>finalize') || j.taken.includes('finance>finalize'),
+   'case2: finance branch reached finalize (proven or inferred)')
+ok(!j.taken.includes('finance>finalize'),
+   'case2: an unprovable quorum branch is NOT claimed as proven')
 ok(!j.visited.includes('request_info'), 'case2: request_info never visited')
 ok(!j.visited.includes('end_rejected'), 'case2: end_rejected not visited')
 ok(j.current === 'end_approved', `case2: current = end_approved (got ${j.current})`)
 ok(j.outcome === 'approved', 'case2: outcome approved -> green tint')
+
+// ---- Case 2b: the quorum IS met in the audit (2 of 3 approvals) -> proven, solid
+j = deriveJourney(INVOICE, [
+  ev('WORKFLOW_RUNNING', {}),
+  ev('LLM_DECISION', { node_id: 'review', route: 'OTHERWISE' }),
+  ev('TASK_CREATED', { node_id: 'manager', role: 'manager' }),
+  ev('HUMAN_DECISION', { decision: 'approve' }),
+  ev('LLM_DECISION', { node_id: 'afterManager', route: 'R1' }),
+  ev('TASK_CREATED', { node_id: 'finance', role: 'finance' }),
+  ev('FINANCE_VOTE', { decision: 'approve', participant: 'fin1' }),
+  ev('FINANCE_VOTE', { decision: 'approve', participant: 'fin2' }),
+], 'approved')
+ok(j.taken.includes('finance>finalize'),
+   'case2b: 2 of 3 approvals recorded -> quorum branch PROVEN (solid)')
+ok(!(j.inferred || []).includes('finance>finalize'), 'case2b: nothing left to infer')
+ok(j.current === 'end_approved' && j.outcome === 'approved', 'case2b: ends approved')
+
+// ---- Case 2c: the quorum REJECTED -> the reject branch is taken, not the approve one
+j = deriveJourney(INVOICE, [
+  ev('LLM_DECISION', { node_id: 'review', route: 'OTHERWISE' }),
+  ev('TASK_CREATED', { node_id: 'manager', role: 'manager' }),
+  ev('HUMAN_DECISION', { decision: 'approve' }),
+  ev('LLM_DECISION', { node_id: 'afterManager', route: 'R1' }),
+  ev('TASK_CREATED', { node_id: 'finance', role: 'finance' }),
+  ev('FINANCE_VOTE', { decision: 'reject', participant: 'fin1' }),
+  ev('FINANCE_VOTE', { decision: 'reject', participant: 'fin2' }),
+], 'rejected')
+ok(j.current === 'end_rejected' && j.outcome === 'rejected', 'case2c: quorum rejected -> end_rejected')
+ok(!j.taken.includes('finance>finalize'), 'case2c: the approve branch is NOT highlighted')
 
 // ---- Case 3: manager rejected
 j = deriveJourney(INVOICE, [

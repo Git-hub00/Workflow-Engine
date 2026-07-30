@@ -40,20 +40,3 @@ export const get = (path) => request(path)
 export const post = (path, body) => request(path, { method: 'POST', body })
 export const put = (path, body) => request(path, { method: 'PUT', body })
 export const del = (path) => request(path, { method: 'DELETE' })
-
-// Multipart upload: let the browser set the multipart boundary (no Content-Type).
-export async function upload(path, formData) {
-  await keycloak.updateToken(30)
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${keycloak.token}` },
-    body: formData,
-  })
-  const responseText = await response.text()
-  if (!response.ok) {
-    const error = new Error(responseText || `${response.status} ${response.statusText}`)
-    error.status = response.status
-    throw error
-  }
-  return responseText ? JSON.parse(responseText) : null
-}

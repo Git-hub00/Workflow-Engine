@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { get, post, put, upload } from './api'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { get, post } from './api'
 import keycloak from './keycloak'
 import { uuid } from './uuid'
 import { FlowDiagram, GenericTaskForm, ProcessFlowDynamic } from './generic'
@@ -66,6 +66,12 @@ function deriveJourney(pdd, events, status) {
 
   const anchors = []                 // human/decision steps really entered, in order
   const routes = {}                  // decision step -> the routes it chose, in order
+  // What each human step actually DECIDED, read from the audit trail. Without this
+  // the walk could only guess which branch a human step took and drew the guess as
+  // if it were fact; now an approve/reject (or a counted quorum) is known.
+  const humanDecisions = {}          // step -> ['approve', 'reject', …] in order
+  let lastTaskNode = null
+  const votes = {}                   // quorum step -> {approve: n, reject: n}
   for (const e of events || []) {
     const p = e.payload || {}
     if (e.type === 'LLM_DECISION' && p.node_id) {
@@ -73,11 +79,53 @@ function deriveJourney(pdd, events, status) {
       ;(routes[p.node_id] = routes[p.node_id] || []).push(p.route)
     } else if (e.type === 'TASK_CREATED' && p.node_id) {
       anchors.push(p.node_id)
+      lastTaskNode = p.node_id
+    } else if (e.type === 'HUMAN_DECISION' && lastTaskNode && p.decision) {
+      ;(humanDecisions[lastTaskNode] = humanDecisions[lastTaskNode] || []).push(String(p.decision))
+    } else if (e.type === 'FINANCE_VOTE' && lastTaskNode && p.decision) {
+      const tally = votes[lastTaskNode] || (votes[lastTaskNode] = { approve: 0, reject: 0 })
+      if (p.decision === 'approve' || p.decision === 'reject') tally[p.decision] += 1
     }
   }
 
+  // Resolve a human step's branch from what was decided there.
+  const usedDecision = {}
+  const branchOf = (id) => {
+    const node = byId[id]
+    const edges = Array.isArray(node && node.edges) ? node.edges : null
+    if (!edges || !edges.length) return null
+    const quorum = (node.completion || {}).mode === 'quorum'
+    let ctx = null
+    if (quorum) {
+      // Only conclude from POSITIVE evidence: enough approvals were recorded to meet
+      // the quorum. Too few votes does NOT mean rejected — voting may still be in
+      // progress, or (as with an SLA auto-decision) the outcome may not come from
+      // the votes at all. In those cases we return null and let the walk aim at the
+      // step the events/outcome actually show, instead of inventing a rejection.
+      const tally = votes[id]
+      const needed = Number((node.completion || {}).n)
+      if (tally && Number.isFinite(needed) && tally.approve >= needed) {
+        ctx = { quorum_approved: true, decision: 'approve' }
+      }
+    } else {
+      const q = humanDecisions[id] || []
+      const i = usedDecision[id] || 0
+      if (q[i] !== undefined) { usedDecision[id] = i + 1; ctx = { decision: q[i] } }
+    }
+    if (!ctx) return null
+    for (const edge of edges) {
+      const when = String(edge.when || '').trim()
+      if (when === 'default' || when === '') return edge.to || null
+      if (when === 'quorum_approved') { if (ctx.quorum_approved) return edge.to || null; continue }
+      const m = when.match(/^decision\s*==\s*'?([\w-]+)'?$/)
+      if (m && ctx.decision === m[1]) return edge.to || null
+    }
+    return null
+  }
+
   const visited = new Set()
-  const taken = new Set()
+  const taken = new Set()          // connections the events PROVE were followed
+  const inferred = new Set()       // connections we had to guess (drawn dashed)
   const order = []
   const used = {}
   const targetOf = (id) => {
@@ -138,9 +186,18 @@ function deriveJourney(pdd, events, status) {
       continue
     }
 
-    // A human step: the definition alone can't say which way it went. Aim for
-    // the next step the events show was entered; if the run has finished, aim
-    // for the matching end step. Then fill in everything on the way.
+    // A human step. First try the branch its RECORDED DECISION selects — that is a
+    // fact, not a guess, and it is drawn solid.
+    const decided = branchOf(cur)
+    if (decided) {
+      taken.add(`${cur}>${decided}`)
+      cur = decided
+      continue
+    }
+
+    // Still unknown (no decision recorded yet, or an unusual branch shape): aim for
+    // the next step the events show was entered; if the run has finished, aim for
+    // the matching end step. Then fill in everything on the way.
     let aim = anchors[ai] || null
     if (!aim && status && status !== 'running') {
       const endNode = nodes.find((x) => x.type === 'end' && x.outcome === status)
@@ -150,7 +207,14 @@ function deriveJourney(pdd, events, status) {
     const path = shortestPath(cur, aim)
     if (!path) break
     for (let k = 1; k < path.length; k += 1) {
-      taken.add(`${path[k - 1]}>${path[k]}`)
+      const from = path[k - 1]
+      const hop = `${from}>${path[k]}`
+      // A hop is only CERTAIN when the step it leaves had exactly one way out.
+      // Where the bridge passes through a branching step we are guessing, and the
+      // guess can cut through a branch the run never took — so mark it inferred and
+      // let the diagram draw it dashed instead of presenting it as fact.
+      if (outgoing(byId[from]).length === 1) taken.add(hop)
+      else inferred.add(hop)
       visited.add(path[k])
       order.push(path[k])
     }
@@ -168,11 +232,20 @@ function deriveJourney(pdd, events, status) {
   }
   if (current) visited.add(current)
 
+  const endNode = nodes.find((x) => x.type === 'end' && x.outcome === status)
   return {
     visited: [...visited],
     taken: [...taken],
+    inferred: [...inferred].filter((hop) => !taken.has(hop)),
     current,
-    outcome: status === 'approved' || status === 'rejected' ? status : undefined,
+    // Tint the finished step from the workflow's OWN end-step outcome rather than
+    // only the words "approved"/"rejected", so a workflow ending in 'paid' or
+    // 'declined' is still coloured correctly.
+    outcome: status === 'approved' || status === 'rejected'
+      ? status
+      : (endNode && current === endNode.id
+        ? (/reject|declin|deni|cancel|fail/i.test(status) ? 'rejected' : 'approved')
+        : undefined),
   }
 }
 
@@ -248,7 +321,20 @@ function TaskInbox({ roles, username }) {
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
 
+  // The inbox reloads every 5s AND every action reloads it. Each pass makes many
+  // requests, so passes routinely overlap and can finish OUT OF ORDER: a poll that
+  // started BEFORE you approved a task would land afterwards and write the old list
+  // back — the task you just approved reappeared, and a task you just claimed
+  // flipped back to unclaimed (closing the reject-reason box you were typing in).
+  // loadSeq stamps each pass; only the newest pass is allowed to write state, and
+  // mutateSeq invalidates any pass that started before your last action.
+  const loadSeq = useRef(0)
+  const mutateSeq = useRef(0)
+
   const loadTasks = useCallback(async (showLoading = true) => {
+    const myLoad = ++loadSeq.current
+    const mutationsAtStart = mutateSeq.current
+    const isCurrent = () => myLoad === loadSeq.current && mutationsAtStart === mutateSeq.current
     if (showLoading) setLoading(true)
     setLoadError('')
     if (showLoading) setDetails({})
@@ -271,15 +357,31 @@ function TaskInbox({ roles, username }) {
       const failures = [openResult, claimedResult, txResult]
         .filter((result) => result.status === 'rejected')
         .map((result) => apiErrorMessage(result.reason))
+      if (!isCurrent()) return
       setLoadError(failures.length ? `Some data could not be loaded: ${failures[0]}` : '')
 
-      const taskRows = [...openTaskRows, ...claimedTaskRows]
+      const taskRows = [...(Array.isArray(openTaskRows) ? openTaskRows : []),
+                        ...(Array.isArray(claimedTaskRows) ? claimedTaskRows : [])]
       setTasks(taskRows)
 
       const transactionById = Object.fromEntries(
-        transactionRows.map((transaction) => [transaction.id, transaction]),
+        (Array.isArray(transactionRows) ? transactionRows : [])
+          .map((transaction) => [transaction.id, transaction]),
       )
       const transactionIds = [...new Set(taskRows.map((task) => task.transaction_id))]
+      // A task can be older than the newest page of transactions, in which case the
+      // list above does not contain it — the card then said "snapshot unavailable"
+      // and, with no process_key, fell back to plain Approve/Reject instead of the
+      // step's real form. Fetch the missing ones explicitly by id.
+      const missingIds = transactionIds.filter((id) => id && !transactionById[id])
+      if (missingIds.length) {
+        try {
+          const extra = await get(`/v1/transactions?ids=${missingIds.map(encodeURIComponent).join(',')}`)
+          for (const transaction of Array.isArray(extra) ? extra : []) {
+            transactionById[transaction.id] = transaction
+          }
+        } catch { /* the cards degrade gracefully below */ }
+      }
       const detailEntries = await Promise.all(
         transactionIds.map(async (transactionId) => {
           const processKey = transactionById[transactionId]?.process_key ?? null
@@ -307,11 +409,14 @@ function TaskInbox({ roles, username }) {
           }
         }),
       )
+      if (!isCurrent()) return
       setDetails(Object.fromEntries(detailEntries))
 
       // Fetch each process's PDD once so task action forms can render from the
       // node's form_schema (falls back to the classic approve/reject UI).
-      const processKeys = [...new Set(transactionRows.map((t) => t.process_key).filter(Boolean))]
+      const processKeys = [...new Set(
+        Object.values(transactionById).map((t) => t.process_key).filter(Boolean),
+      )]
       const pddEntries = await Promise.all(
         processKeys.map(async (pk) => {
           try {
@@ -321,11 +426,12 @@ function TaskInbox({ roles, username }) {
           }
         }),
       )
+      if (!isCurrent()) return
       setPdds(Object.fromEntries(pddEntries))
     } catch (error) {
-      setLoadError(apiErrorMessage(error))
+      if (myLoad === loadSeq.current) setLoadError(apiErrorMessage(error))
     } finally {
-      if (showLoading) setLoading(false)
+      if (showLoading && myLoad === loadSeq.current) setLoading(false)
     }
   }, [])
 
@@ -340,7 +446,10 @@ function TaskInbox({ roles, username }) {
     : tasks
 
   async function claimTask(task) {
-    setBusyAction(`${task.token}:claim`)
+    const mine = `${task.token}:claim`
+    if (busyAction) return              // an action is already in flight
+    setBusyAction(mine)
+    mutateSeq.current += 1              // invalidate any poll already running
     setFeedback((current) => ({ ...current, [task.token]: null }))
 
     try {
@@ -374,7 +483,11 @@ function TaskInbox({ roles, username }) {
         [task.token]: { type: 'error', message: apiErrorMessage(error) },
       }))
     } finally {
-      setBusyAction('')
+      // Clear ONLY our own guard. A single shared string meant whichever action
+      // finished first re-enabled the OTHER task's buttons while its request was
+      // still in flight — and each click mints a fresh idempotency key, so the
+      // backend could not dedupe the resulting double submission.
+      setBusyAction((current) => (current === mine ? '' : current))
     }
   }
 
@@ -384,7 +497,10 @@ function TaskInbox({ roles, username }) {
     // event (HUMAN_DECISION / FINANCE_VOTE) and the vendor rejection email.
     const decision = decisionArg || 'approve'
     const isFinanceTask = !!task.is_quorum
-    setBusyAction(`${task.token}:complete`)
+    const mine = `${task.token}:complete`
+    if (busyAction) return
+    setBusyAction(mine)
+    mutateSeq.current += 1
     setFeedback((current) => ({ ...current, [task.token]: null }))
 
     try {
@@ -419,7 +535,7 @@ function TaskInbox({ roles, username }) {
         [task.token]: { type: 'error', message: apiErrorMessage(error) },
       }))
     } finally {
-      setBusyAction('')
+      setBusyAction((current) => (current === mine ? '' : current))
     }
   }
 
@@ -434,9 +550,18 @@ function TaskInbox({ roles, username }) {
     return Array.isArray(fields) && fields.length ? fields : null
   }
 
+  // True while we still don't know which workflow this task belongs to, so the
+  // caller can wait instead of offering the wrong (fallback) form.
+  function detailsPending(task) {
+    return details[task.transaction_id] === undefined
+  }
+
   async function submitGenericTask(task, fields) {
     const values = taskDrafts[task.token] || {}
-    const missing = fields.filter((f) => f.required && !values[f.key])
+    const isBlank = (v) => v === undefined || v === null || String(v).trim() === ''
+    // trim(): "   " used to count as filled, so a whitespace-only answer passed
+    // validation and was sent as a real value.
+    const missing = fields.filter((f) => f.required && isBlank(values[f.key]))
     if (missing.length) {
       setFeedback((current) => ({
         ...current,
@@ -444,12 +569,45 @@ function TaskInbox({ roles, username }) {
       }))
       return
     }
-    setBusyAction(`${task.token}:complete`)
+    // Coerce declared number fields. Every value arrives from an <input> as TEXT, so
+    // a numeric field was submitted as "1500" and any rule comparing it numerically
+    // then compared strings — "600" > "5000" is true as text.
+    const cleaned = {}
+    const badNumbers = []
+    for (const field of fields) {
+      const raw = values[field.key]
+      if (isBlank(raw)) continue
+      if (field.type === 'number') {
+        const n = Number(String(raw).replace(/,/g, '').trim())
+        if (!Number.isFinite(n)) { badNumbers.push(field.key); continue }
+        cleaned[field.key] = n
+      } else {
+        cleaned[field.key] = String(raw).trim()
+      }
+    }
+    if (badNumbers.length) {
+      setFeedback((current) => ({
+        ...current,
+        [task.token]: { type: 'error', message: `Must be a number: ${badNumbers.join(', ')}` },
+      }))
+      return
+    }
+    const mine = `${task.token}:complete`
+    if (busyAction) return
+    setBusyAction(mine)
+    mutateSeq.current += 1
     setFeedback((current) => ({ ...current, [task.token]: null }))
     try {
+      // A form step is either an approval (its form carries `decision`) or a
+      // supply-information step, which is a 'resubmit' carrying the values. The
+      // decision is now stated explicitly rather than left absent.
+      const { decision: formDecision, ...rest } = cleaned
+      const payload = formDecision
+        ? { decision: String(formDecision), ...rest }
+        : { decision: 'resubmit', data: rest, ...rest }
       await post(`/v1/tasks/${encodeURIComponent(task.token)}/complete`, {
         idempotency_key: uuid(),
-        payload: { ...values },
+        payload,
         kind: 'human',
       })
       setTasks((current) => current.filter((item) => item.token !== task.token))
@@ -516,6 +674,11 @@ function TaskInbox({ roles, username }) {
           const isClaimedByUser = task.status === 'claimed' && task.claimed_by === username
           // Generic form fields from the PDD (non-finance only; finance keeps the quorum widget).
           const taskFields = isFinanceTask ? null : formSchemaFor(task)
+          // The step's own form arrives one request later than the task itself. Until
+          // then formSchemaFor() returns null and the card offered plain
+          // Approve/Reject — clicking it submitted {decision:'approve'} for a step
+          // that actually required fields.
+          const fieldsPending = !isFinanceTask && detailsPending(task)
           const canSubmitFinanceDecision =
             task.current_user_claimed && !task.current_user_decision && task.can_decide
           // Did GET /v1/tasks actually enrich this finance task with quorum fields?
@@ -714,7 +877,10 @@ function TaskInbox({ roles, username }) {
                       busy={busyAction === `${task.token}:complete`}
                     />
                   )}
-                  {isClaimedByUser && !taskFields &&
+                  {isClaimedByUser && !taskFields && fieldsPending && (
+                    <p className="muted">Loading this step's form…</p>
+                  )}
+                  {isClaimedByUser && !taskFields && !fieldsPending &&
                     (rejectDrafts[task.token] === undefined ? (
                       <div className="finance-vote-buttons">
                         <button
@@ -828,9 +994,13 @@ function Monitor() {
 
   useEffect(() => {
     // Only the workflows this person is allowed to see (admins/authors get all).
+    let alive = true
     get('/v1/my-processes')
-      .then((res) => setProcesses((res && res.processes) || []))
-      .catch(() => setProcesses([]))
+      .then((res) => { if (alive) setProcesses((res && res.processes) || []) })
+      // Show the reason. A silent [] made the workflow strip simply vanish, which
+      // looks identical to "you are assigned to nothing".
+      .catch((e) => { if (alive) { setProcesses([]); setError(apiErrorMessage(e)) } })
+    return () => { alive = false }
   }, [])
 
   useEffect(() => {
@@ -849,10 +1019,15 @@ function Monitor() {
           get(`/v1/transactions/stats${proc ? `?process_key=${encodeURIComponent(proc)}` : ''}`),
         ])
         if (active) {
-          setTransactions(rows)
-          setStats(counts)
+          // Guard the shape: an empty response body comes back as null from the API
+          // helper, and transactions.map() would then throw during render — a white
+          // screen the try/catch here cannot reach.
+          setTransactions(Array.isArray(rows) ? rows : [])
+          setStats(counts && typeof counts === 'object' ? counts : null)
           setSelected((current) => (
-            current ? rows.find((transaction) => transaction.id === current.id) || current : null
+            current
+              ? (Array.isArray(rows) ? rows : []).find((t) => t.id === current.id) || current
+              : null
           ))
           setError('')
         }
@@ -882,12 +1057,31 @@ function Monitor() {
 
   // Counts come from /v1/transactions/stats: they reflect ALL transactions,
   // not just the visible page.
-  const monitorCounts = stats || { total: 0, running: 0, approved: 0, rejected: 0 }
+  const monitorCounts = stats || { total: 0, running: 0, approved: 0, rejected: 0, other: 0 }
   const totalForFilter = monitorCounts[filter] ?? 0
   const totalPages = Math.max(1, Math.ceil(totalForFilter / PAGE_SIZE))
 
+  // A workflow can end in ANY outcome its author names (paid, declined, completed…),
+  // and a run whose engine could not be started is 'failed'. Those used to be counted
+  // in Total but shown nowhere, so the boxes did not add up. The "Other" box appears
+  // only when such runs exist, and lists which statuses they are.
+  const otherCount = monitorCounts.other || 0
+  const otherStatuses = Object.keys(monitorCounts.by_status || {})
+    .filter((s) => !['running', 'approved', 'rejected'].includes(s))
+  const visibleKpis = otherCount > 0
+    ? [...monitorKpis, { key: 'other', label: otherStatuses.length === 1 ? otherStatuses[0] : 'Other' }]
+    : monitorKpis
+
+  // Never strand the user on a page that no longer exists: as runs complete, a
+  // filter's page count shrinks, and page stayed at (say) 2 of 1 — both arrows
+  // disabled, "No transactions have been recorded", no way back.
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages)
+  }, [page, totalPages])
+
   function selectKpi(key) {
-    setFilter(key)
+    // 'other' is a bucket, not a single status — page through it unfiltered.
+    setFilter(key === 'other' && otherStatuses.length !== 1 ? 'total' : (key === 'other' ? otherStatuses[0] : key))
     setPage(1)
     setSelected(null)
   }
@@ -899,12 +1093,26 @@ function Monitor() {
   // Clicking a transaction starts BOTH loads at once: the flow (fast) renders
   // immediately, while the AI-narrated audit keeps loading in the background so
   // it is usually ready by the time the Log tab is opened.
-  async function selectTransaction(transaction) {
+  // Every write below is gated on `mine === openSeq.current`. Without that guard,
+  // clicking row A then row B showed A's diagram and A's audit under B's heading if
+  // A happened to resolve last — and A's "finished loading" also killed B's spinner
+  // early. Both loads also kept writing after the popup was closed.
+  const openSeq = useRef(0)
+  // "<id>:<status>" of whatever the popup currently shows, so the refresh effect
+  // below never re-loads what we just loaded (which would double every click).
+  const shownKey = useRef('')
+
+  async function selectTransaction(transaction, { keepTab = false } = {}) {
+    const mine = ++openSeq.current
+    const isCurrent = () => mine === openSeq.current
+    shownKey.current = `${transaction.id}:${normalizeStatus(transaction.status)}`
     setSelected(transaction)
-    setTab('flow')
-    setHistory([])
+    if (!keepTab) setTab('flow')
+    if (!keepTab) {
+      setHistory([])
+      setJourney(null)
+    }
     setHistoryError('')
-    setJourney(null)
     setFlowError('')
     setFlowLoading(true)
     setHistoryLoading(true)
@@ -919,21 +1127,36 @@ function Monitor() {
           ? get(`/v1/definitions/${encodeURIComponent(transaction.process_key)}`)
           : Promise.resolve(null),
       ])
+      if (!isCurrent()) return
       setJourneyPdd(def)
       setJourney(deriveJourney(def, events || [], normalizeStatus(transaction.status)))
     } catch (requestError) {
-      setFlowError(apiErrorMessage(requestError))
+      if (isCurrent()) setFlowError(apiErrorMessage(requestError))
     } finally {
-      setFlowLoading(false)
+      if (isCurrent()) setFlowLoading(false)
     }
 
     // Slow path (AI writes a sentence per event) — runs on its own, never blocks
     // the flow. Deterministic text is used by the backend if the model is slow.
     get(`/v1/transactions/${id}/history?format=narrative`)
-      .then((events) => setHistory(events || []))
-      .catch((requestError) => setHistoryError(apiErrorMessage(requestError)))
-      .finally(() => setHistoryLoading(false))
+      .then((events) => { if (isCurrent()) setHistory(events || []) })
+      .catch((requestError) => { if (isCurrent()) setHistoryError(apiErrorMessage(requestError)) })
+      .finally(() => { if (isCurrent()) setHistoryLoading(false) })
   }
+
+  // Keep the OPEN popup live. The 5s poll refreshes `selected`, so the Log tab's
+  // status pill advanced while the Flow tab kept its original "NOW HERE" ring —
+  // the same popup could show "approved" next to a diagram still pointing at a
+  // human step. Re-derive whenever the selected run's status changes.
+  const selectedId = selected?.id
+  const selectedStatus = normalizeStatus(selected?.status)
+  useEffect(() => {
+    if (!selectedId) { shownKey.current = ''; return }
+    if (shownKey.current === `${selectedId}:${selectedStatus}`) return   // already shown
+    const row = transactions.find((t) => t.id === selectedId)
+    if (row) selectTransaction(row, { keepTab: true })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, selectedStatus])
 
   function closeModal() { setSelected(null) }
 
@@ -976,7 +1199,7 @@ function Monitor() {
       ) : (
         <>
           <div className="kpi-grid">
-            {monitorKpis.map((kpi) => (
+            {visibleKpis.map((kpi) => (
               <button
                 className={`kpi-card kpi-card-${kpi.key} ${filter === kpi.key ? 'kpi-selected' : ''}`}
                 type="button"
@@ -1108,9 +1331,10 @@ function Monitor() {
                     height="100%"
                     visited={journey ? journey.visited : undefined}
                     taken={journey ? journey.taken : undefined}
+                    inferred={journey ? journey.inferred : undefined}
                     current={journey ? journey.current : undefined}
                     outcome={journey ? journey.outcome : undefined}
-                    legend="Bold blue = path travelled · ringed = where it is now · faded = never used · Shift+scroll to zoom"
+                    legend="Bold blue = path travelled · dashed = likely, not recorded · ringed = where it is now · faded = never used · Shift+scroll to zoom"
                   />
                 )}
               </>
@@ -1147,9 +1371,21 @@ function Monitor() {
   )
 }
 
+// Keycloak puts its OWN plumbing roles in every token. They are not business
+// roles, and counting them made isBusiness TRUE for absolutely everyone — so a
+// pure author or admin always opened on an empty Task Inbox, and the header listed
+// "offline_access" and "uma_authorization" as if they were the person's roles.
+// (The API filters the same set; see _BUILTIN_ROLES in services/api/app/main.py.)
+const BUILTIN_ROLES = new Set(['offline_access', 'uma_authorization', 'admin', 'create-realm'])
+
+function businessRoles(all) {
+  return (all || []).filter((r) => !BUILTIN_ROLES.has(r) && !String(r).startsWith('default-roles'))
+}
+
 function App() {
   const username = keycloak.tokenParsed?.preferred_username || 'Unknown user'
-  const roles = keycloak.tokenParsed?.realm_access?.roles || []
+  const allRoles = keycloak.tokenParsed?.realm_access?.roles || []
+  const roles = useMemo(() => businessRoles(allRoles), [allRoles])
   // Generic, role-based tabs — no process-specific role names. Anyone can hold
   // tasks and start a request; authors get the Builder; admins get Monitor + Admin.
   const isAuthor = roles.includes('process_author')
@@ -1165,6 +1401,12 @@ function App() {
   if (isBusiness || isOps) navTabs.push({ id: 'monitor', label: 'Monitor' })
   if (isOps) navTabs.push({ id: 'admin', label: 'Admin' })
   const [activeTab, setActiveTab] = useState(navTabs[0].id)
+  // If the token's roles ever change the visible tabs (re-login, role edit), never
+  // leave the app pointing at a tab that is no longer rendered — that showed an
+  // empty page with no tab highlighted.
+  useEffect(() => {
+    if (!navTabs.some((t) => t.id === activeTab)) setActiveTab(navTabs[0].id)
+  }, [navTabs.map((t) => t.id).join(','), activeTab])
 
   // Measure the sticky header+tabs once (and on resize) so anything that must
   // sit below them (the Builder's sticky preview) always lines up.

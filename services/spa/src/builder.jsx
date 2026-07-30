@@ -10,7 +10,7 @@
 //
 // Everything assembles into a PDD and publishes via the Definition Service
 // (/v1/definitions[/validate]). No engine change.
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { get, post } from './api'
 import { FlowDiagram } from './generic'
 
@@ -38,8 +38,19 @@ function pddToState(pdd) {
   ))
   const dataFields = Object.entries(pdd.data_schema || {}).map(([name, type]) => ({ id: uid(), name, type }))
   const steps = []
+  // Steps this guided editor has no card for (gateways, parallel forks, an unusual
+  // dialect). They are CARRIED THROUGH VERBATIM and re-emitted on save.
+  // Previously the if/else chain below had no else, so such a step was dropped on
+  // load and the next "Save changes" DELETED it from the live workflow, leaving
+  // dangling connections pointing at a step that no longer existed.
+  const passthrough = []
+  // Remember where the workflow actually STARTS. The start node is skipped below and
+  // rebuilt on save as "the first card in the list" — so a workflow whose real first
+  // step is one this editor cannot draw (a gateway) silently got a new entry point,
+  // leaving that step unreachable with only an advisory warning.
+  let startAt = ''
   for (const node of pdd.nodes || []) {
-    if (node.type === 'start') continue
+    if (node.type === 'start') { startAt = typeof node.next === 'string' ? node.next : ''; continue }
     const base = { key: uid(), name: node.id }
     const to = node.timeout || {}
     if (node.type === 'automated') steps.push({ ...base, kind: 'automatic', action: node.action || '', next: node.next || '' })
@@ -60,11 +71,17 @@ function pddToState(pdd) {
       if (Array.isArray(node.edges)) {
         const quorum = (node.completion || {}).mode === 'quorum'
         let approveTo = '', rejectTo = ''
+        // Only the DEFAULT branch is the reject branch. "else rejectTo = e.to" made
+        // every other branch (a third "return" route, say) overwrite it last-wins,
+        // so a load+save round trip silently collapsed three branches into two.
+        const extraEdges = []
         for (const e of node.edges) {
           const w = String(e.when || '').trim()
           if (w === 'quorum_approved' || w === "decision == 'approve'") approveTo = e.to
-          else rejectTo = e.to
+          else if (w === 'default' || w === '') rejectTo = e.to
+          else extraEdges.push(e)
         }
+        if (extraEdges.length) base.extraEdges = extraEdges
         steps.push({
           ...base, kind: 'approval', role, completion: quorum ? 'quorum' : 'single',
           quorumN: quorum ? String((node.completion || {}).n || '') : '',
@@ -74,15 +91,27 @@ function pddToState(pdd) {
           approveTo, rejectTo,
         })
       } else {
-        const fields = ((node.form_schema || {}).fields || []).map((f) => f.key)
+        // Keep each field's declared type and whether it is required. Reading only
+        // f.key and re-emitting required:true silently made every optional field
+        // mandatory, and turned number fields into text, on a load+save round trip.
+        const fields = ((node.form_schema || {}).fields || []).map((f) => (
+          typeof f === 'string'
+            ? { key: f, type: 'string', required: true }
+            : { key: f.key, type: f.type || 'string', required: f.required !== false }
+        )).filter((f) => f.key)
         steps.push({ ...base, kind: 'collect', role, fields, slaHours: to.slaHours ? String(to.slaHours) : '', next: node.next || '' })
       }
+    } else {
+      passthrough.push(node)
     }
   }
   const notifications = (pdd.notifications || []).map((n) => ({
     id: uid(), on: n.on || '', target: n.to === 'submitter' ? 'submitter' : (n.to_role || ''), template: n.template || '',
   }))
-  return { processKey: pdd.process_key || '', mailbox: pdd.mailbox || '', config, dataFields, steps, notifications }
+  return {
+    processKey: pdd.process_key || '', mailbox: pdd.mailbox || '',
+    config, dataFields, steps, notifications, passthrough, startAt,
+  }
 }
 
 const KIND_META = {
@@ -100,6 +129,30 @@ const OPS = ['<', '<=', '>', '>=', '==', '!=', 'in', 'not in']
 
 function Err({ msg }) {
   return msg ? <span className="field-error">{msg}</span> : null
+}
+
+// Declared at MODULE level so their component type is stable across renders.
+function RoleSelectBase({ roles, value, onChange }) {
+  return (
+    <select value={value || ''} onChange={(e) => onChange(e.target.value)}>
+      <option value="">choose role…</option>
+      {(roles || []).map((r) => <option key={r} value={r}>{r}</option>)}
+      {value && !(roles || []).includes(value) && <option value={value}>{value}</option>}
+    </select>
+  )
+}
+
+function StepSelectBase({ options, value, onChange, placeholder = 'choose step…' }) {
+  const missing = value && !(options || []).includes(value)
+  return (
+    <select value={value || ''} onChange={(e) => onChange(e.target.value)}>
+      <option value="">{placeholder}</option>
+      {(options || []).map((n) => <option key={n} value={n}>{n}</option>)}
+      {/* Keep a target that no longer exists VISIBLE. Without this the picker went
+          blank after a rename and the author could not see what was broken. */}
+      {missing && <option value={value}>{value} (missing)</option>}
+    </select>
+  )
 }
 
 function Chips({ items, onChange, placeholder = 'add value…' }) {
@@ -137,36 +190,78 @@ export function ProcessBuilder() {
 
   const [loadedKey, setLoadedKey] = useState(null)
   const [processList, setProcessList] = useState([])   // every process the author can edit
+  const [passthrough, setPassthrough] = useState([])   // steps this editor cannot draw
+  const [startAt, setStartAt] = useState('')           // the workflow's own entry point
+  const [loadingProcess, setLoadingProcess] = useState('')
+  const loadSeq = useRef(0)
 
-  useEffect(() => { get('/v1/roles').then((r) => setRoles(Array.isArray(r) ? r : [])).catch(() => setRoles([])) }, [])
+  useEffect(() => {
+    // Report the failure instead of showing an empty role list, which is
+    // indistinguishable from "the admin has not created any roles yet".
+    get('/v1/roles').then((r) => setRoles(Array.isArray(r) ? r : []))
+      .catch((e) => { setRoles([]); setFeedback({ type: 'error', message: `Could not load roles: ${e.message || e}` }) })
+  }, [])
 
   // MANY workflows: list them all so the author can switch between them.
   const refreshList = () => get('/v1/definitions')
     .then((rows) => setProcessList((rows || []).map((r) => r.process_key).filter(Boolean)))
-    .catch(() => setProcessList([]))
+    .catch((e) => {
+      setProcessList([])
+      setFeedback({ type: 'error', message: `Could not load your workflows: ${e.message || e}` })
+    })
   useEffect(() => { refreshList() }, [])
+
+  const isDirty = () => Boolean(processKey || steps.length || config.length || dataFields.length)
 
   // Load one process into the editor (click its button in the strip).
   function loadProcess(key) {
     if (!key) return
-    setFeedback(null); setValidation(null)
+    if (key !== loadedKey && isDirty()
+        && !window.confirm('Switch workflow? Unsaved changes to the current one will be lost.')) return
+    const mine = ++loadSeq.current
+    setFeedback(null); setValidation(null); setLoadingProcess(key)
     get(`/v1/definitions/${encodeURIComponent(key)}`).then((pdd) => {
-      if (!pdd || !Array.isArray(pdd.nodes)) return
+      if (mine !== loadSeq.current) return          // a later click already won
+      if (!pdd || !Array.isArray(pdd.nodes)) {
+        // Silently returning made clicking a chip look like nothing happened while
+        // the PREVIOUS workflow stayed on screen (and highlighted).
+        setFeedback({ type: 'error', message: `“${key}” has no readable definition.` })
+        return
+      }
       const s = pddToState(pdd)
       setProcessKey(s.processKey); setMailbox(s.mailbox); setConfig(s.config)
       setDataFields(s.dataFields); setSteps(s.steps); setNotifications(s.notifications)
+      setPassthrough(s.passthrough || [])
+      setStartAt(s.startAt || '')
       setLoadedKey(s.processKey)
-    }).catch((e) => setFeedback({ type: 'error', message: e.message || String(e) }))
+      if ((s.passthrough || []).length) {
+        setFeedback({
+          type: 'success',
+          message: `${s.passthrough.length} step(s) in this workflow cannot be edited here `
+            + `(${s.passthrough.map((n) => n.id).join(', ')}). They are kept exactly as they are when you save.`,
+        })
+      }
+    }).catch((e) => {
+      if (mine === loadSeq.current) setFeedback({ type: 'error', message: e.message || String(e) })
+    }).finally(() => { if (mine === loadSeq.current) setLoadingProcess('') })
   }
 
   function newBlank() {
+    if (isDirty() && !window.confirm('Start a new workflow? Unsaved changes will be lost.')) return
+    loadSeq.current += 1
     setProcessKey(''); setMailbox(''); setConfig([]); setDataFields([]); setSteps([]); setNotifications([])
-    setValidation(null); setFeedback(null); setLoadedKey(null)
+    setPassthrough([]); setStartAt(''); setValidation(null); setFeedback(null); setLoadedKey(null)
   }
 
   // ---- derived option lists --------------------------------------------
   const stepNames = steps.map((s) => s.name).filter(Boolean)
-  const goTo = (selfName) => stepNames.filter((n) => n !== selfName)
+  // Steps this editor cannot draw are still REAL steps in the workflow, so they must
+  // be selectable as targets and must count as existing. Without them, any workflow
+  // containing a gateway had every connection into that gateway flagged as
+  // "no longer exists" and could never be saved again.
+  const passIds = passthrough.map((n) => n && n.id).filter(Boolean)
+  const allTargets = [...stepNames, ...passIds]
+  const goTo = (selfName) => allTargets.filter((n) => n !== selfName)
   const fieldNames = dataFields.map((f) => f.name).filter(Boolean)
   const configKeys = config.map((c) => c.key).filter(Boolean)
   const fieldOptions = [
@@ -244,7 +339,10 @@ export function ProcessBuilder() {
       else cfg[c.key] = c.value ?? ''
     })
 
-    const outNodes = [{ id: 'start', type: 'start', ...(stepNames[0] ? { next: stepNames[0] } : {}) }]
+    // Keep the workflow's ORIGINAL entry point when it still exists (it may be a
+    // step this editor cannot draw); otherwise start at the first card.
+    const entry = (startAt && allTargets.includes(startAt)) ? startAt : stepNames[0]
+    const outNodes = [{ id: 'start', type: 'start', ...(entry ? { next: entry } : {}) }]
     steps.forEach((s) => {
       if (s.kind === 'automatic') {
         outNodes.push({ id: s.name, type: 'automated', action: s.action || '', ...(s.next ? { next: s.next } : {}) })
@@ -253,7 +351,17 @@ export function ProcessBuilder() {
       } else if (s.kind === 'finish') {
         outNodes.push({ id: s.name, type: 'end', outcome: s.outcome || 'completed' })
       } else if (s.kind === 'collect') {
-        const fields = (s.fields || []).map((k) => ({ key: k, type: (dataFields.find((d) => d.name === k) || {}).type || 'string', required: true }))
+        // Fields may be plain names (added in this session) or full specs loaded
+        // from the saved definition — keep whatever type/required they already had.
+        const fields = (s.fields || []).map((f) => {
+          const key = typeof f === 'string' ? f : f.key
+          const declared = (dataFields.find((d) => d.name === key) || {}).type
+          return {
+            key,
+            type: (typeof f === 'object' && f.type) || declared || 'string',
+            required: typeof f === 'object' && f.required !== undefined ? !!f.required : true,
+          }
+        }).filter((f) => f.key)
         outNodes.push({
           id: s.name, type: 'human_task', assignment: { role: s.role || '' },
           ...(fields.length ? { form_schema: { fields } } : {}),
@@ -275,11 +383,13 @@ export function ProcessBuilder() {
         const edges = []
         if (s.completion === 'quorum') {
           if (s.approveTo) edges.push({ when: 'quorum_approved', to: s.approveTo })
-          if (s.rejectTo) edges.push({ when: 'default', to: s.rejectTo })
-        } else {
-          if (s.approveTo) edges.push({ when: "decision == 'approve'", to: s.approveTo })
-          if (s.rejectTo) edges.push({ when: 'default', to: s.rejectTo })
+        } else if (s.approveTo) {
+          edges.push({ when: "decision == 'approve'", to: s.approveTo })
         }
+        // Extra branches loaded from the saved workflow keep their place, BEFORE the
+        // default one (order = priority, and 'default' matches everything).
+        ;(s.extraEdges || []).forEach((e) => { if (e && e.to) edges.push(e) })
+        if (s.rejectTo) edges.push({ when: 'default', to: s.rejectTo })
         if (edges.length) node.edges = edges
         outNodes.push(node)
       } else if (s.kind === 'decision') {
@@ -287,7 +397,11 @@ export function ProcessBuilder() {
         const edges = {}
         ;(s.rules || []).forEach((r, i) => {
           if (!r.field || !r.to) return
-          const edge = r.field === 'has_missing' ? 'REQUEST_INFO' : `R${i + 1}`
+          // Edge names must be UNIQUE. Two "has missing fields" rules both produced
+          // REQUEST_INFO, so edges.REQUEST_INFO was overwritten and one route was
+          // silently lost. Suffix any repeat.
+          let edge = r.field === 'has_missing' ? 'REQUEST_INFO' : `R${i + 1}`
+          if (edges[edge] !== undefined) edge = `${edge}_${i + 1}`
           routes.push({ edge, when: ruleWhen(r) })
           edges[edge] = r.to
         })
@@ -295,8 +409,13 @@ export function ProcessBuilder() {
         outNodes.push({ id: s.name, type: 'llm_decision', routes, edges })
       }
     })
+    // Re-emit steps this editor cannot draw, exactly as they were loaded, so saving
+    // never deletes part of the workflow.
+    passthrough.forEach((node) => {
+      if (node && node.id && !outNodes.some((n) => n.id === node.id)) outNodes.push(node)
+    })
 
-    const pdd = { process_key: processKey, version: 1, roles: rolesMap, nodes: outNodes }
+    const pdd = { process_key: processKey, roles: rolesMap, nodes: outNodes }
     if (mailbox) pdd.mailbox = mailbox
     if (Object.keys(cfg).length) pdd.config = cfg
     if (Object.keys(dataSchema).length) pdd.data_schema = dataSchema
@@ -308,7 +427,10 @@ export function ProcessBuilder() {
     if (notifs.length) pdd.notifications = notifs
     return pdd
   }
-  const pdd = useMemo(buildPdd, [processKey, mailbox, config, dataFields, steps, notifications])
+  // version is deliberately NOT set here: the server assigns the next version and
+  // stores it authoritatively. Sending a hardcoded 1 was misleading in every edit.
+  const pdd = useMemo(buildPdd,
+    [processKey, mailbox, config, dataFields, steps, notifications, passthrough, startAt])
 
   // ---- inline validation ------------------------------------------------
   const errs = useMemo(() => {
@@ -318,34 +440,81 @@ export function ProcessBuilder() {
     if (!mailbox.trim()) general.push('Set a mailbox name.')
     if (steps.length === 0) general.push('Add at least one step.')
     if (!steps.some((s) => s.kind === 'finish')) general.push('Add a Finish step.')
+    // Config values declared as numbers must BE numbers. Number('abc') is NaN and
+    // JSON.stringify turns it into null, so a rule like "amount >= threshold"
+    // silently compared against null at runtime with no error anywhere.
+    config.forEach((c) => {
+      if (c.kind === 'number' && String(c.value ?? '').trim() !== ''
+          && !Number.isFinite(Number(String(c.value).trim()))) {
+        general.push(`Setting “${c.key || 'unnamed'}” must be a number.`)
+      }
+      if (!c.key && (c.value || (c.items || []).length)) general.push('A setting is missing its name.')
+    })
+
     const names = steps.map((s) => s.name)
+    // Include the carried-through steps: they exist in the workflow even though this
+    // editor cannot show them as cards.
+    const known = new Set([...names.filter(Boolean), ...passIds])
+    // Every target must still EXIST. Renaming a step used to leave the other steps
+    // pointing at the old name: the picker just went blank, no error appeared, and
+    // Save published a workflow with connections to a step that was gone.
+    const target = (e, field, value, label) => {
+      if (!value) e[field] = label
+      else if (!known.has(value)) e[field] = `“${value}” no longer exists — pick a step`
+    }
     steps.forEach((s) => {
       const e = {}
       if (!s.name) e.name = 'Name this step'
       else if (names.filter((n) => n === s.name).length > 1) e.name = 'Duplicate step name'
-      if (s.kind === 'automatic') { if (!s.action) e.action = 'Pick an action'; if (!s.next) e.next = 'Choose the next step' }
-      if (s.kind === 'wait') { if (!s.hours) e.hours = 'Set the wait time'; if (!s.next) e.next = 'Choose the next step' }
+      if (s.kind === 'automatic') {
+        if (!s.action) e.action = 'Pick an action'
+        target(e, 'next', s.next, 'Choose the next step')
+      }
+      if (s.kind === 'wait') {
+        const hours = Number(String(s.hours ?? '').trim())
+        if (!s.hours) e.hours = 'Set the wait time'
+        else if (!Number.isFinite(hours) || hours < 0) e.hours = 'Wait time must be 0 or more hours'
+        target(e, 'next', s.next, 'Choose the next step')
+      }
       if (s.kind === 'finish') { if (!s.outcome) e.outcome = 'Set an outcome' }
       if (s.kind === 'collect') {
         if (!s.role) e.role = 'Choose who provides it'
         if (!(s.fields || []).length) e.fields = 'Pick at least one field'
-        if (!s.next) e.next = 'Choose the next step'
+        target(e, 'next', s.next, 'Choose the next step')
       }
       if (s.kind === 'approval') {
         if (!s.role) e.role = 'Choose an approver role'
-        if (s.completion === 'quorum' && (!s.quorumN || !s.quorumOf)) e.quorum = 'Set N and M'
-        if (!s.approveTo) e.approveTo = 'Set where approved goes'
-        if (!s.rejectTo) e.rejectTo = 'Set where rejected goes'
+        if (s.completion === 'quorum') {
+          // Catch an impossible quorum HERE. "2 of 1" used to save happily and then
+          // made every single submission to the workflow fail.
+          const n = Number(String(s.quorumN ?? '').trim())
+          const of = Number(String(s.quorumOf ?? '').trim())
+          if (!s.quorumN || !s.quorumOf) e.quorum = 'Set how many approvals are needed, and out of how many approvers'
+          else if (!Number.isInteger(n) || !Number.isInteger(of)) e.quorum = 'Both numbers must be whole numbers'
+          else if (n < 1) e.quorum = 'At least 1 approval is needed'
+          else if (n > of) e.quorum = `${n} approvals out of ${of} approver(s) can never be reached`
+        }
+        const slaH = String(s.slaHours ?? '').trim()
+        if (slaH && (!Number.isFinite(Number(slaH)) || Number(slaH) <= 0)) {
+          e.sla = 'Deadline must be a positive number of hours'
+        }
+        target(e, 'approveTo', s.approveTo, 'Set where approved goes')
+        target(e, 'rejectTo', s.rejectTo, 'Set where rejected goes')
       }
       if (s.kind === 'decision') {
-        if (!s.otherwiseTo) e.otherwise = 'Set an “Otherwise →” target (the fallback when no rule matches)'
+        target(e, 'otherwise', s.otherwiseTo,
+          'Set an “Otherwise →” target (the fallback when no rule matches)')
         if (!(s.rules || []).some((r) => r.field && r.to)) e.rules = 'Add at least one rule → step'
+        else {
+          const dangling = (s.rules || []).filter((r) => r.to && !known.has(r.to)).map((r) => r.to)
+          if (dangling.length) e.rules = `Rule points at a step that no longer exists: ${dangling.join(', ')}`
+        }
       }
       perStep[s.key] = e
     })
     const count = general.length + steps.reduce((a, s) => a + Object.keys(perStep[s.key] || {}).length, 0)
     return { perStep, general, count }
-  }, [processKey, mailbox, steps, dataFields, config])
+  }, [processKey, mailbox, steps, dataFields, config, passthrough])
 
   async function validate() {
     setBusy(true); setFeedback(null)
@@ -354,6 +523,17 @@ export function ProcessBuilder() {
     finally { setBusy(false) }
   }
   async function publish() {
+    // Refuse to save a workflow the inline checks already know is broken. It used to
+    // be possible to publish with dangling connections or an impossible quorum.
+    if (errs.count > 0) {
+      setFeedback({
+        type: 'error',
+        message: `Fix ${errs.count} problem${errs.count === 1 ? '' : 's'} first`
+          + (errs.general.length ? `: ${errs.general[0]}` : ' (see the red notes on the steps).'),
+      })
+      return
+    }
+    if (busy) return
     setBusy(true); setFeedback(null)
     try {
       const res = await post('/v1/definitions', { pdd })
@@ -366,19 +546,15 @@ export function ProcessBuilder() {
     } finally { setBusy(false) }
   }
 
-  const RoleSelect = ({ value, onChange }) => (
-    <select value={value || ''} onChange={(e) => onChange(e.target.value)}>
-      <option value="">choose role…</option>
-      {roles.map((r) => <option key={r} value={r}>{r}</option>)}
-      {value && !roles.includes(value) && <option value={value}>{value}</option>}
-    </select>
-  )
-  const StepSelect = ({ value, onChange, selfName, placeholder = 'choose step…' }) => (
-    <select value={value || ''} onChange={(e) => onChange(e.target.value)}>
-      <option value="">{placeholder}</option>
-      {goTo(selfName).map((n) => <option key={n} value={n}>{n}</option>)}
-    </select>
-  )
+  // Thin wrappers over the module-level components (declared below the builder).
+  // They USED to be declared here, inside the component body, which makes them a
+  // BRAND-NEW component type on every render: React then unmounted and remounted
+  // every <select> on each keystroke, closing any open dropdown and losing focus.
+  const RoleSelect = useCallback(
+    (props) => <RoleSelectBase roles={roles} {...props} />, [roles])
+  const StepSelect = useCallback(
+    (props) => <StepSelectBase options={goTo(props.selfName)} {...props} />,
+    [allTargets.join(',')])
 
   return (
     <section className="view builder" aria-labelledby="builder-heading">
@@ -399,7 +575,10 @@ export function ProcessBuilder() {
         {processList.map((key) => (
           <button type="button" key={key} role="tab" aria-selected={loadedKey === key}
             className={`process-chip ${loadedKey === key ? 'active' : ''}`}
-            onClick={() => loadProcess(key)}>{key}</button>
+            disabled={Boolean(loadingProcess)}
+            onClick={() => loadProcess(key)}>
+            {loadingProcess === key ? `${key}…` : key}
+          </button>
         ))}
         {processList.length === 0 && <span className="muted">No workflows yet — click “+ New” to build your first one.</span>}
       </div>
@@ -614,7 +793,17 @@ export function ProcessBuilder() {
                 </select>
                 {c.kind === 'list'
                   ? <Chips items={c.items || []} onChange={(items) => patchRow(setConfig, c.id, { items })} />
-                  : <input placeholder="value" value={c.value ?? ''} onChange={(e) => patchRow(setConfig, c.id, { value: e.target.value })} />}
+                  : (
+                    <input
+                      /* type=number for a number setting: the plain text input let
+                         "abc" through, which became null in the saved workflow. */
+                      type={c.kind === 'number' ? 'number' : 'text'}
+                      step="any"
+                      placeholder="value"
+                      value={c.value ?? ''}
+                      onChange={(e) => patchRow(setConfig, c.id, { value: e.target.value })}
+                    />
+                  )}
                 <button type="button" className="icon-btn" onClick={() => removeRow(setConfig, c.id)}>×</button>
               </div>
             ))}

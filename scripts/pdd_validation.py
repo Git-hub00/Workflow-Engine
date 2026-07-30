@@ -1,7 +1,7 @@
 # scripts/pdd_validation.py
 #
 # Canonical, dependency-free PDD structural validation. Single source of truth,
-# imported by the CLI (validate_pdd.py) AND the API's Definition Service (P3). It
+# imported by the API's Definition Service (P3) — see _check_pdd in the API. It
 # checks the graph is well-formed; Keycloak role-existence is layered on top by
 # the API (which has network access), not here.
 NODE_TYPES = {
@@ -28,7 +28,11 @@ def validate_pdd(pdd: dict):
     """Return (errors, warnings). errors are blocking; warnings are advisory."""
     errors, warnings = [], []
 
-    for key in ("process_key", "version", "roles", "nodes"):
+    # `version` is deliberately NOT required from the caller: the server assigns the
+    # next version number and stores it authoritatively on publish. Requiring it here
+    # meant the Builder had to invent one (it always sent 1, which was wrong for every
+    # edit), and removing that made every save fail validation.
+    for key in ("process_key", "roles", "nodes"):
         if key not in pdd:
             errors.append(f"missing top-level key: {key}")
     if errors:

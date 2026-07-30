@@ -394,22 +394,6 @@ def _submitted_by_email(txn_id: str) -> str | None:
     return None
 
 
-def _vendor_email_for_txn(txn_id: str) -> str | None:
-    # For a request_info step only: target the submitting vendor. Other steps
-    # return None so the caller falls back to NOTIFY_TO.
-    with engine.connect() as conn:
-        node = conn.execute(
-            text(
-                "SELECT node_id FROM task WHERE transaction_id = CAST(:t AS uuid) "
-                "AND status = 'open' ORDER BY created_at DESC LIMIT 1"
-            ),
-            {"t": txn_id},
-        ).scalar_one_or_none()
-    if node != "request_info":
-        return None
-    return _submitted_by_email(txn_id)
-
-
 def _latest_reject_reason(txn_id: str) -> str | None:
     # Most recent reject decision's reason (manager HUMAN_DECISION or FINANCE_VOTE)
     # from the immutable event log — no workflow-arg plumbing needed.
@@ -659,8 +643,11 @@ async def notify(txn_id: str, channel: str, message: str, recipient: dict | None
         subject, body = message, message
 
     msg = EmailMessage()
-    # The [invoice-<txn_id>] tag ties replies back to this run (email adapter 9.3).
-    msg["Subject"] = f"[invoice-{txn_id}] {subject}"
+    # The [ref-<txn_id>] tag ties replies back to this run (email adapter 9.3).
+    # Neutral prefix: this engine runs leave, refunds, onboarding and anything else,
+    # so the old "[invoice-...]" tag was wrong in every non-invoice email. The
+    # adapter's matcher accepts ANY prefix, so tags already sent still correlate.
+    msg["Subject"] = f"[ref-{txn_id}] {subject}"
     msg["From"] = box["address"]
     msg["To"] = ", ".join(recipients)
     # Send just the message. (The old hardcoded "reply with approve/reject/return"

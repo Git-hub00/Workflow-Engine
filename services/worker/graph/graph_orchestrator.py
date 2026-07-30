@@ -21,7 +21,7 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
-    from invoice_activities import append_event, notify
+    from invoice_activities import append_event, notify, set_transaction_status
     from graph_activities import graph_advance
     from pdd_norm import normalize_pdd, is_quorum
 
@@ -43,9 +43,25 @@ class GraphOrchestratorWorkflow:
         self._signal = None
         self._votes = {}
         self._finance_result = None
+        self._awaiting = None       # id of the step currently waiting for a person
+        self._roles = {}
+        self._notifications = []
+        self._mailbox = None
+        self._process_key = "request"
 
     @workflow.signal
     def human_decision(self, payload: dict):
+        # CORRELATION GUARD. A task row stays 'open' when the workflow abandons its
+        # step (e.g. an SLA auto_approve), and Temporal delivers signals at least
+        # once — so a decision for an EARLIER step could arrive while a LATER step is
+        # waiting and resolve the wrong step. If the sender tells us which step the
+        # decision belongs to, ignore it unless it matches the step we are waiting
+        # on. Payloads without a node_id are accepted unchanged (older callers).
+        node_id = (payload or {}).get("node_id")
+        if node_id and self._awaiting and node_id != self._awaiting:
+            workflow.logger.warning(
+                "ignoring decision for step %r while waiting on %r", node_id, self._awaiting)
+            return
         self._signal = payload
 
     @workflow.signal
@@ -77,10 +93,22 @@ class GraphOrchestratorWorkflow:
             graph_advance, args=[txn_id, pdd, None], start_to_close_timeout=_T_ADVANCE)
 
         self._process_key = norm.get("process_key") or "request"
+        # Bound the loop. Every iteration is one human step; a definition that keeps
+        # bouncing between the same two steps (a collect-info loop with a rule that
+        # never clears) would otherwise grow Temporal history without limit until the
+        # workflow is force-terminated. 500 human steps is far beyond any real
+        # process, so hitting it means the definition is broken.
+        hops = 0
         while status.get("status") == "paused":
+            hops += 1
+            if hops > 500:
+                await self._fail(
+                    txn_id,
+                    f"stopped after {hops - 1} human steps — the flow is looping "
+                    f"through '{status.get('node')}' without ever finishing")
             node = nodes.get(status.get("node"))
             if node is None:
-                raise ApplicationError(f"paused on unknown node '{status.get('node')}'", non_retryable=True)
+                await self._fail(txn_id, f"paused on unknown step '{status.get('node')}'")
             decision = await self._handle_human(
                 txn_id, node, status.get("data") or {}, status.get("missing") or [])
             status = await workflow.execute_activity(
@@ -89,6 +117,25 @@ class GraphOrchestratorWorkflow:
         outcome = status.get("outcome", "completed")
         await self._notify_completed(txn_id, outcome, status.get("data") or {})
         return outcome
+
+    async def _fail(self, txn_id, reason: str):
+        """Record the failure in the database, THEN fail the workflow.
+
+        Failing a Temporal workflow does not touch the database, so without this the
+        transaction stayed 'running' forever in the Monitor — a phantom run with no
+        task and nothing in the product able to close it."""
+        try:
+            await workflow.execute_activity(
+                append_event,
+                args=[txn_id, "engine", "WORKFLOW_FAILED", "LangGraph", reason],
+                start_to_close_timeout=_T_SHORT)
+            await workflow.execute_activity(
+                set_transaction_status, args=[txn_id, "failed"],
+                start_to_close_timeout=_T_SHORT)
+        except Exception as exc:                # never hide the real reason
+            workflow.logger.warning("could not mark transaction failed: %s", exc)
+        raise ApplicationError(f"workflow definition error: {reason}",
+                               type="DefinitionError", non_retryable=True)
 
     # ---- human wait (durable) --------------------------------------------
     async def _handle_human(self, txn_id, node, data=None, missing=None):
@@ -109,7 +156,17 @@ class GraphOrchestratorWorkflow:
         }
 
     async def _await_human(self, txn_id, node, data=None, missing=None):
-        self._signal = None
+        self._awaiting = node.get("id")
+        # KEEP a decision that already arrived FOR THIS STEP. The task row is created
+        # inside the graph_advance activity, so a fast reply (or an email that lands
+        # the instant the task appears) can be signalled BEFORE this method runs.
+        # Unconditionally clearing _signal here threw that decision away, and the
+        # person then waited for the SLA reminder before anything happened.
+        # Anything belonging to a DIFFERENT step is still discarded.
+        pending = self._signal
+        if not (isinstance(pending, dict)
+                and pending.get("node_id") in (None, self._awaiting)):
+            self._signal = None
         message, recipient = self._task_notification(node)
         # A step that needs missing fields emails the SUBMITTER (they supply them);
         # a pure approval step emails the assigned role.
@@ -136,8 +193,10 @@ class GraphOrchestratorWorkflow:
 
         if timed_out:
             if on_timeout == "auto_approve":
+                self._awaiting = None
                 return {"decision": "approve", "auto": True}
             if on_timeout == "auto_reject":
+                self._awaiting = None
                 return {"decision": "reject", "auto": True}
             # Nudge, then keep waiting for a real person (no deadline this time).
             await workflow.execute_activity(
@@ -146,6 +205,7 @@ class GraphOrchestratorWorkflow:
                               {**self._email_context(node, data, missing), "kind": "task"}],
                 start_to_close_timeout=_T_NOTIFY, retry_policy=_NOTIFY_RETRY)
             await workflow.wait_condition(lambda: self._signal is not None)
+        self._awaiting = None
         return self._signal
 
     async def _quorum(self, txn_id, node, data=None, missing=None) -> bool:
@@ -174,7 +234,31 @@ class GraphOrchestratorWorkflow:
             remaining = of - len(self._votes)
             return not rsc and approvals + remaining < n
 
-        await workflow.wait_condition(decided)
+        # A multi-approver step gets a deadline and a REMINDER, so it can no longer
+        # wait forever when one of the required approvers never votes (the run used to
+        # sit at 'running' indefinitely with no nudge and nothing able to rescue it).
+        #
+        # But a quorum deliberately NEVER auto-decides. The Builder writes
+        # `on_timeout` for every approval step, so honouring auto_approve here would
+        # have let a "2 of 3" gate approve itself after the deadline with ZERO votes
+        # recorded — silently defeating the whole point of requiring a quorum. A
+        # missed deadline nudges the approvers and keeps waiting for real votes.
+        sla_hours = node.get("sla_hours") or 48
+        timed_out = False
+        try:
+            await workflow.wait_condition(decided, timeout=timedelta(hours=sla_hours))
+        except asyncio.TimeoutError:
+            timed_out = True
+
+        if timed_out:
+            await workflow.execute_activity(
+                notify, args=[txn_id, "email",
+                              f"Reminder: {node.get('id')} is still waiting for votes",
+                              recipient, self._mailbox,
+                              {**self._email_context(node, data, missing), "kind": "task"}],
+                start_to_close_timeout=_T_NOTIFY, retry_policy=_NOTIFY_RETRY)
+            await workflow.wait_condition(decided)
+
         if self._finance_result is not None:
             return self._finance_result == "approve"
         return sum(1 for v in self._votes.values() if v == "approve") >= n
