@@ -138,59 +138,113 @@ function computeLayout(pdd) {
 // Pure diagram from a PDD object.
 //
 // Optional highlighting (used by the Monitor to show ONE transaction's journey):
-//   visited  Set/array of step ids the run actually passed through
-//   taken    Set/array of "from>to" edge keys the run actually followed
+//   visited  step ids the run actually passed through
+//   taken    "from>to" connections the run actually followed
 //   current  the step the run is sitting at right now
 //   outcome  'approved' | 'rejected' -> tints the finished step green / red
 // Passing none of them keeps the plain design-time look (Builder preview).
-export function FlowDiagram({ pdd, height = 520, visited, taken, current, outcome }) {
-  const layout = pdd && Array.isArray(pdd.nodes) && pdd.nodes.length ? computeLayout(pdd) : null
-  const [view, setView] = useState(null)          // null until we auto-fit
-  const drag = useRef(null)
+//
+// IMPORTANT design notes (these fixed real bugs):
+//  * The layout is MEMOISED. It used to be recalculated on every render, so every
+//    mouse-move while dragging re-ran the whole graph layout — that is what made
+//    dragging heavy enough to hang/reload the tab.
+//  * The "fit" transform is DERIVED, never stored in state. Storing it in state
+//    from an effect keyed on a derived value could bounce
+//    (state -> render -> new value -> state ...) into React's update-depth crash,
+//    which looks exactly like the page reloading itself.
+//  * The SVG viewBox matches the BOX IN PIXELS, and the graph is scaled+centred
+//    into it. Previously the viewBox was the graph's own size with "meet", so a
+//    wide, short graph fitted the width and left the bottom half of the box empty.
+//  * The wheel only zooms with SHIFT held; a plain wheel is left alone so the page
+//    scrolls normally.
+export function FlowDiagram({ pdd, height = 520, visited, taken, current, outcome, legend }) {
+  const layout = useMemo(
+    () => (pdd && Array.isArray(pdd.nodes) && pdd.nodes.length ? computeLayout(pdd) : null),
+    [pdd],
+  )
   const boxRef = useRef(null)
+  const [box, setBox] = useState({ w: 0, h: 0 })
+  const [view, setView] = useState(null)      // null = follow the auto-fit
+  const drag = useRef(null)
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v))
 
   const vSet = useMemo(() => new Set(visited || []), [visited])
   const tSet = useMemo(() => new Set(taken || []), [taken])
   const highlighting = Boolean(visited || current)
 
-  // Fit the whole graph on first paint (and when the graph changes) so nothing is
-  // ever cut off inside the box. Previously the default zoom could push the lower
-  // half out of a fixed-height box with no way back except Reset.
-  const fitScale = layout
-    ? clamp(Math.min(1, (height - 24) / layout.height), 0.25, 1)
-    : 1
-  useEffect(() => { setView({ s: fitScale, x: 0, y: 0 }) }, [fitScale, layout && layout.width, layout && layout.height])
-
-  // Wheel zoom must be a NON-PASSIVE listener, otherwise the browser ignores
-  // preventDefault() and scrolls the PAGE instead of zooming the graph (that was
-  // the "the whole page jumps / I had to reload" glitch).
+  // Keep the box's pixel size (so the graph can be scaled to fill it).
   useEffect(() => {
     const el = boxRef.current
     if (!el) return undefined
-    const onWheelNative = (e) => {
-      e.preventDefault()
-      setView((v) => ({ ...(v || { x: 0, y: 0 }), s: clamp((v ? v.s : 1) * (e.deltaY < 0 ? 1.1 : 0.9), 0.25, 2.5) }))
+    const measure = () => setBox((b) => {
+      const w = el.clientWidth
+      const h = el.clientHeight
+      return b.w === w && b.h === h ? b : { w, h }
+    })
+    measure()
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(measure) : null
+    if (ro) ro.observe(el)
+    window.addEventListener('resize', measure)
+    return () => {
+      if (ro) ro.disconnect()
+      window.removeEventListener('resize', measure)
     }
-    el.addEventListener('wheel', onWheelNative, { passive: false })
-    return () => el.removeEventListener('wheel', onWheelNative)
   }, [])
 
-  if (!layout) return <p className="muted">Add a start step (and connect steps) to see the diagram.</p>
-  const v = view || { s: fitScale, x: 0, y: 0 }
+  // Scale + centre the graph so it FILLS the box. Pure maths, no state.
+  const fit = useMemo(() => {
+    if (!layout || !box.w || !box.h) return { s: 1, x: 0, y: 0 }
+    const pad = 18
+    const raw = Math.min((box.w - pad * 2) / layout.width, (box.h - pad * 2) / layout.height)
+    const s = Math.max(0.15, Math.min(raw, 1.75))
+    return { s, x: (box.w - layout.width * s) / 2, y: (box.h - layout.height * s) / 2 }
+  }, [layout, box.w, box.h])
 
-  // Keep the graph inside the box: panning is limited to the scaled size.
-  const limitX = Math.max(120, layout.width * v.s * 0.6)
-  const limitY = Math.max(120, layout.height * v.s * 0.6)
-  const zoom = (f) => setView((c) => ({ ...(c || v), s: clamp((c ? c.s : v.s) * f, 0.25, 2.5) }))
-  const onDown = (e) => { drag.current = { x: e.clientX, y: e.clientY, ox: v.x, oy: v.y } }
+  const v = view || fit
+
+  // Keep the graph reachable: it can never be dragged completely out of the box.
+  const clampView = (nv) => {
+    if (!layout) return nv
+    const w = layout.width * nv.s
+    const h = layout.height * nv.s
+    const slack = 60
+    return {
+      s: nv.s,
+      x: clamp(nv.x, Math.min(0, box.w - w) - slack, Math.max(0, box.w - w) + slack),
+      y: clamp(nv.y, Math.min(0, box.h - h) - slack, Math.max(0, box.h - h) + slack),
+    }
+  }
+
+  // Zoom around the middle of the box.
+  const zoomBy = (f) => setView(() => {
+    const s = clamp(v.s * f, 0.15, 3)
+    const k = s / v.s
+    return clampView({ s, x: box.w / 2 - (box.w / 2 - v.x) * k, y: box.h / 2 - (box.h / 2 - v.y) * k })
+  })
+
+  // SHIFT + wheel zooms; a plain wheel is ignored so the PAGE scrolls as usual.
+  useEffect(() => {
+    const el = boxRef.current
+    if (!el) return undefined
+    const onWheel = (e) => {
+      if (!e.shiftKey) return                 // let the page scroll
+      e.preventDefault()
+      zoomBy(e.deltaY < 0 ? 1.12 : 0.89)
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  })
+
+  const onDown = (e) => {
+    drag.current = { x: e.clientX, y: e.clientY, ox: v.x, oy: v.y }
+    if (e.currentTarget.setPointerCapture && e.pointerId != null) {
+      try { e.currentTarget.setPointerCapture(e.pointerId) } catch { /* ignore */ }
+    }
+  }
   const onMove = (e) => {
     if (!drag.current) return
-    setView((c) => ({
-      ...(c || v),
-      x: clamp(drag.current.ox + (e.clientX - drag.current.x), -limitX, limitX),
-      y: clamp(drag.current.oy + (e.clientY - drag.current.y), -limitY, limitY),
-    }))
+    const d = drag.current
+    setView(() => clampView({ s: v.s, x: d.ox + (e.clientX - d.x), y: d.oy + (e.clientY - d.y) }))
   }
   const onUp = () => { drag.current = null }
 
@@ -202,7 +256,7 @@ export function FlowDiagram({ pdd, height = 520, visited, taken, current, outcom
     if (n.id === current && n.type === 'end') return END_FILL[outcome] || '#e0f2fe'
     if (n.id === current) return '#e0f2fe'
     if (vSet.has(n.id)) return NODE_FILL[n.type] || '#f1f5f9'
-    return '#f8fafc'                                  // untouched -> pale
+    return '#f8fafc'
   }
   const nodeStroke = (n) => {
     if (!highlighting) return NODE_STROKE[n.type] || '#cbd5e1'
@@ -211,102 +265,120 @@ export function FlowDiagram({ pdd, height = 520, visited, taken, current, outcom
     if (vSet.has(n.id)) return NODE_STROKE[n.type] || '#cbd5e1'
     return '#e2e8f0'
   }
-  const nodeOpacity = (n) => (highlighting && !vSet.has(n.id) && n.id !== current ? 0.45 : 1)
+  const nodeOpacity = (n) => (highlighting && !vSet.has(n.id) && n.id !== current ? 0.4 : 1)
   const edgeOn = (a, b) => !highlighting || tSet.has(`${a}>${b}`)
 
   return (
     <div className="flow-canvas" ref={boxRef}
          style={{ height, position: 'relative', overflow: 'hidden' }}>
       <div className="flow-zoom">
-        <button type="button" onClick={() => zoom(1.2)} title="Zoom in">+</button>
-        <button type="button" onClick={() => zoom(0.8)} title="Zoom out">-</button>
-        <button type="button" onClick={() => setView({ s: fitScale, x: 0, y: 0 })} title="Fit the whole flow">Fit</button>
+        <button type="button" onClick={() => zoomBy(1.2)} title="Zoom in">+</button>
+        <button type="button" onClick={() => zoomBy(0.8)} title="Zoom out">-</button>
+        <button type="button" onClick={() => setView(null)} title="Fit the whole flow">Fit</button>
       </div>
-      <svg
-        width="100%"
-        height="100%"
-        viewBox={`0 0 ${layout.width} ${layout.height}`}
-        preserveAspectRatio="xMidYMid meet"
-        role="img"
-        aria-label="Process flow diagram"
-        style={{ cursor: 'grab', userSelect: 'none' }}
-        onMouseDown={onDown}
-        onMouseMove={onMove}
-        onMouseUp={onUp}
-        onMouseLeave={onUp}
-      >
-        <defs>
-          <marker id="bld-arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
-            <polygon points="0 0, 9 3.5, 0 7" fill="#94a3b8" />
-          </marker>
-          <marker id="bld-arrow-on" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto">
-            <polygon points="0 0, 10 4, 0 8" fill="#2563eb" />
-          </marker>
-        </defs>
-        <g transform={`translate(${v.x} ${v.y}) scale(${v.s})`}>
-          {layout.links.map((link, idx) => {
-            const a = layout.pos[link.from]
-            const b = layout.pos[link.to]
-            if (!a || !b) return null
-            const BW = layout.BW, BH = layout.BH
-            const back = b.x <= a.x        // loop-back / same-column edge
-            let d, lx, ly
-            if (back) {
-              // Arc OVER the top so a return edge (e.g. request_info -> review) is
-              // clearly visible instead of hiding straight behind the boxes.
-              const sx = a.x + BW / 2, sy = a.y
-              const ex = b.x + BW / 2, ey = b.y
-              const arc = Math.min(sy, ey) - 42
-              d = `M ${sx} ${sy} C ${sx} ${arc}, ${ex} ${arc}, ${ex} ${ey}`
-              lx = (sx + ex) / 2; ly = arc - 4
-            } else {
-              const x1 = a.x + BW, y1 = a.y + BH / 2
-              const x2 = b.x, y2 = b.y + BH / 2
-              const mx = (x1 + x2) / 2
-              d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`
-              lx = mx; ly = (y1 + y2) / 2 - 5
-            }
-            const label = link.label && link.label.length > 18 ? `${link.label.slice(0, 17)}...` : link.label
-            const on = edgeOn(link.from, link.to)
-            return (
-              <g key={`bld-e-${idx}`} opacity={on ? 1 : 0.3}>
-                <path d={d} fill="none" stroke={on && highlighting ? '#2563eb' : '#94a3b8'}
-                      strokeWidth={on && highlighting ? 2.6 : 1.4}
-                      markerEnd={on && highlighting ? 'url(#bld-arrow-on)' : 'url(#bld-arrow)'} />
-                {label && (
-                  <text x={lx} y={ly} textAnchor="middle" fontSize="10"
-                        fill={on && highlighting ? '#1d4ed8' : '#475569'}
-                        stroke="#ffffff" strokeWidth="3" paintOrder="stroke">{label}</text>
-                )}
-              </g>
-            )
-          })}
-          {layout.nodes.map((n) => {
-            const p = layout.pos[n.id]
-            if (!p) return null
-            const isCurrent = n.id === current
-            return (
-              <g key={n.id} opacity={nodeOpacity(n)}>
-                {isCurrent && (
-                  <rect x={p.x - 5} y={p.y - 5} width={layout.BW + 10} height={layout.BH + 10} rx="15"
-                        fill="none" stroke={nodeStroke(n)} strokeWidth="2.5" opacity="0.45" />
-                )}
-                <rect x={p.x} y={p.y} width={layout.BW} height={layout.BH} rx="12"
-                      fill={nodeFill(n)} stroke={nodeStroke(n)}
-                      strokeWidth={isCurrent ? 2.8 : 1.5} />
-                <text x={p.x + layout.BW / 2} y={p.y + 26} textAnchor="middle" fontSize="13" fontWeight="600" fill="#1e293b">{n.id}</text>
-                <text x={p.x + layout.BW / 2} y={p.y + 44} textAnchor="middle" fontSize="10" fill="#64748b">{n.type}</text>
-                {isCurrent && (
-                  <text x={p.x + layout.BW / 2} y={p.y - 10} textAnchor="middle" fontSize="10"
-                        fontWeight="800" fill={nodeStroke(n)}>
-                    {n.type === 'end' ? (outcome === 'rejected' ? 'REJECTED' : 'COMPLETED') : 'NOW HERE'}
-                  </text>
-                )}
-              </g>
-            )
-          })}
-        </g>
-      </svg>
+
+      {!layout && (
+        <p className="muted" style={{ padding: 16 }}>Add a start step (and connect steps) to see the diagram.</p>
+      )}
+
+      {layout && box.w > 0 && (
+        <svg
+          width="100%"
+          height="100%"
+          viewBox={`0 0 ${box.w} ${box.h}`}
+          role="img"
+          aria-label="Process flow diagram"
+          style={{ cursor: 'grab', userSelect: 'none', touchAction: 'none', display: 'block' }}
+          onPointerDown={onDown}
+          onPointerMove={onMove}
+          onPointerUp={onUp}
+          onPointerLeave={onUp}
+          onPointerCancel={onUp}
+        >
+          <defs>
+            <marker id="bld-arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+              <polygon points="0 0, 9 3.5, 0 7" fill="#94a3b8" />
+            </marker>
+            <marker id="bld-arrow-on" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto">
+              <polygon points="0 0, 10 4, 0 8" fill="#2563eb" />
+            </marker>
+          </defs>
+          <g transform={`translate(${v.x} ${v.y}) scale(${v.s})`}>
+            {layout.links.map((link, idx) => {
+              const a = layout.pos[link.from]
+              const b = layout.pos[link.to]
+              if (!a || !b) return null
+              const BW = layout.BW
+              const BH = layout.BH
+              const back = b.x <= a.x
+              let d
+              let lx
+              let ly
+              if (back) {
+                const sx = a.x + BW / 2
+                const sy = a.y
+                const ex = b.x + BW / 2
+                const ey = b.y
+                const arc = Math.min(sy, ey) - 42
+                d = `M ${sx} ${sy} C ${sx} ${arc}, ${ex} ${arc}, ${ex} ${ey}`
+                lx = (sx + ex) / 2
+                ly = arc - 4
+              } else {
+                const x1 = a.x + BW
+                const y1 = a.y + BH / 2
+                const x2 = b.x
+                const y2 = b.y + BH / 2
+                const mx = (x1 + x2) / 2
+                d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`
+                lx = mx
+                ly = (y1 + y2) / 2 - 5
+              }
+              const label = link.label && link.label.length > 18 ? `${link.label.slice(0, 17)}...` : link.label
+              const on = edgeOn(link.from, link.to)
+              return (
+                <g key={`bld-e-${idx}`} opacity={on ? 1 : 0.3}>
+                  <path d={d} fill="none" stroke={on && highlighting ? '#2563eb' : '#94a3b8'}
+                        strokeWidth={on && highlighting ? 2.6 : 1.4}
+                        markerEnd={on && highlighting ? 'url(#bld-arrow-on)' : 'url(#bld-arrow)'} />
+                  {label && (
+                    <text x={lx} y={ly} textAnchor="middle" fontSize="10"
+                          fill={on && highlighting ? '#1d4ed8' : '#475569'}
+                          stroke="#ffffff" strokeWidth="3" paintOrder="stroke">{label}</text>
+                  )}
+                </g>
+              )
+            })}
+            {layout.nodes.map((n) => {
+              const p = layout.pos[n.id]
+              if (!p) return null
+              const isCurrent = n.id === current
+              return (
+                <g key={n.id} opacity={nodeOpacity(n)}>
+                  {isCurrent && (
+                    <rect x={p.x - 5} y={p.y - 5} width={layout.BW + 10} height={layout.BH + 10} rx="15"
+                          fill="none" stroke={nodeStroke(n)} strokeWidth="2.5" opacity="0.45" />
+                  )}
+                  <rect x={p.x} y={p.y} width={layout.BW} height={layout.BH} rx="12"
+                        fill={nodeFill(n)} stroke={nodeStroke(n)}
+                        strokeWidth={isCurrent ? 2.8 : 1.5} />
+                  <text x={p.x + layout.BW / 2} y={p.y + 26} textAnchor="middle" fontSize="13"
+                        fontWeight="600" fill="#1e293b">{n.id}</text>
+                  <text x={p.x + layout.BW / 2} y={p.y + 44} textAnchor="middle" fontSize="10"
+                        fill="#64748b">{n.type}</text>
+                  {isCurrent && (
+                    <text x={p.x + layout.BW / 2} y={p.y - 10} textAnchor="middle" fontSize="10"
+                          fontWeight="800" fill={nodeStroke(n)}>
+                      {n.type === 'end' ? (outcome === 'rejected' ? 'REJECTED' : 'COMPLETED') : 'NOW HERE'}
+                    </text>
+                  )}
+                </g>
+              )
+            })}
+          </g>
+        </svg>
+      )}
+
+      {legend && <div className="flow-legend-corner">{legend}</div>}
     </div>
   )
 }

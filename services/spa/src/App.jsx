@@ -205,6 +205,15 @@ function LoadingPanel({ label = 'Loading…' }) {
   return <div className="loading-panel">{label}</div>
 }
 
+// A plain animated spinner — no wording, used inside the transaction popup.
+function Spinner() {
+  return (
+    <div className="spinner-wrap" role="status" aria-label="Loading">
+      <span className="spinner" />
+    </div>
+  )
+}
+
 function InvoiceFields({ data }) {
   if (!data) {
     return <p className="muted">Invoice snapshot is unavailable in the recent transaction list.</p>
@@ -887,6 +896,9 @@ function Monitor() {
   // definition) so the Flow tab appears immediately. The AI-narrated audit is
   // slow (it asks the model to write a sentence per event), so it is fetched
   // ONLY when the Log tab is actually opened.
+  // Clicking a transaction starts BOTH loads at once: the flow (fast) renders
+  // immediately, while the AI-narrated audit keeps loading in the background so
+  // it is usually ready by the time the Log tab is opened.
   async function selectTransaction(transaction) {
     setSelected(transaction)
     setTab('flow')
@@ -895,9 +907,14 @@ function Monitor() {
     setJourney(null)
     setFlowError('')
     setFlowLoading(true)
+    setHistoryLoading(true)
+
+    const id = encodeURIComponent(transaction.id)
+
+    // Fast path: raw events + the workflow definition -> the highlighted flow.
     try {
       const [events, def] = await Promise.all([
-        get(`/v1/transactions/${encodeURIComponent(transaction.id)}/history`),
+        get(`/v1/transactions/${id}/history`),
         transaction.process_key
           ? get(`/v1/definitions/${encodeURIComponent(transaction.process_key)}`)
           : Promise.resolve(null),
@@ -909,25 +926,13 @@ function Monitor() {
     } finally {
       setFlowLoading(false)
     }
-  }
 
-  async function openLogTab() {
-    setTab('log')
-    if (history.length || historyLoading) return          // already have it
-    setHistoryError('')
-    setHistoryLoading(true)
-    try {
-      // AI-narrated audit: one clean sentence per event (the backend falls back
-      // to deterministic text when the LLM is slow/unavailable — never raw JSON).
-      const events = await get(
-        `/v1/transactions/${encodeURIComponent(selected.id)}/history?format=narrative`,
-      )
-      setHistory(events)
-    } catch (requestError) {
-      setHistoryError(apiErrorMessage(requestError))
-    } finally {
-      setHistoryLoading(false)
-    }
+    // Slow path (AI writes a sentence per event) — runs on its own, never blocks
+    // the flow. Deterministic text is used by the backend if the model is slow.
+    get(`/v1/transactions/${id}/history?format=narrative`)
+      .then((events) => setHistory(events || []))
+      .catch((requestError) => setHistoryError(apiErrorMessage(requestError)))
+      .finally(() => setHistoryLoading(false))
   }
 
   function closeModal() { setSelected(null) }
@@ -1047,7 +1052,6 @@ function Monitor() {
         <section className="modal-panel" role="dialog" aria-modal="true" aria-labelledby="audit-heading">
           <div className="audit-heading">
             <div>
-              <p className="eyebrow">Transaction drill-down</p>
               <h3 id="audit-heading">{selected.process_key || 'Transaction'}</h3>
               <p className="mono">{selected.id}</p>
             </div>
@@ -1060,9 +1064,12 @@ function Monitor() {
             <button type="button" role="tab" aria-selected={tab === 'flow'}
               className={tab === 'flow' ? 'active' : ''} onClick={() => setTab('flow')}>Flow</button>
             <button type="button" role="tab" aria-selected={tab === 'log'}
-              className={tab === 'log' ? 'active' : ''} onClick={openLogTab}>Log</button>
+              className={tab === 'log' ? 'active' : ''} onClick={() => setTab('log')}>Log</button>
           </div>
 
+          {/* Status / Process / Created / Closed belong to the Log tab only —
+              the Flow tab is kept clear so the diagram gets the whole area. */}
+          {tab === 'log' && (
           <dl className="monitor-detail-grid">
             <div>
               <dt>Status</dt>
@@ -1085,37 +1092,33 @@ function Monitor() {
               <dd>{formatDate(selected.closed_at)}</dd>
             </div>
           </dl>
+          )}
 
-          <div className="modal-body">
+          <div className={`modal-body ${tab === 'flow' ? 'no-scroll' : ''}`}>
             {tab === 'flow' && (
               <>
-                {flowLoading && <LoadingPanel label="Building the flow…" />}
+                {flowLoading && <Spinner />}
                 {flowError && <Feedback feedback={{ type: 'error', message: flowError }} />}
                 {!flowLoading && !flowError && !journeyPdd && (
                   <p className="muted">This transaction&apos;s workflow definition could not be loaded.</p>
                 )}
                 {!flowLoading && journeyPdd && (
-                  <>
-                    <p className="muted flow-legend">
-                      Bold blue = the path this request travelled · ringed step = where it is now ·
-                      faded = never used
-                    </p>
-                    <FlowDiagram
-                      pdd={journeyPdd}
-                      height={430}
-                      visited={journey ? journey.visited : undefined}
-                      taken={journey ? journey.taken : undefined}
-                      current={journey ? journey.current : undefined}
-                      outcome={journey ? journey.outcome : undefined}
-                    />
-                  </>
+                  <FlowDiagram
+                    pdd={journeyPdd}
+                    height="100%"
+                    visited={journey ? journey.visited : undefined}
+                    taken={journey ? journey.taken : undefined}
+                    current={journey ? journey.current : undefined}
+                    outcome={journey ? journey.outcome : undefined}
+                    legend="Bold blue = path travelled · ringed = where it is now · faded = never used · Shift+scroll to zoom"
+                  />
                 )}
               </>
             )}
 
             {tab === 'log' && (
               <>
-                {historyLoading && <LoadingPanel label="Writing the audit trail…" />}
+                {historyLoading && <Spinner />}
                 {historyError && <Feedback feedback={{ type: 'error', message: historyError }} />}
                 {!historyLoading && !historyError && history.length === 0 && (
                   <p className="muted">No audit events have been recorded for this transaction.</p>

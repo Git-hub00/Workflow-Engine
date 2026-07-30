@@ -1,7 +1,9 @@
 .app-shell {
-  width: min(1480px, 100%);
+  /* Full window width — the old max of 1480px left empty margins on wide
+     screens (the "gaps on the left and right" at 80% zoom). */
+  width: 100%;
   min-height: 100vh;
-  margin: 0 auto;
+  margin: 0;
 }
 
 .app-header {
@@ -1571,10 +1573,40 @@ td.mono {
 
 /* Only the tab CONTENT scrolls — the header and tabs stay visible. */
 .modal-body { flex: 1 1 auto; overflow-y: auto; padding-top: 14px; min-height: 0; }
-.flow-legend { font-size: 0.78rem; margin: 0 0 10px; }
+/* The Flow tab must NOT scroll: the diagram fills the whole remaining area. */
+.modal-body.no-scroll { overflow: hidden; display: flex; flex-direction: column; }
+.modal-body.no-scroll .flow-canvas { flex: 1 1 auto; min-height: 0; }
+
+/* Tiny legend tucked into the diagram's bottom-right corner. */
+.flow-legend-corner {
+  position: absolute;
+  right: 10px;
+  bottom: 8px;
+  font-size: 0.66rem;
+  line-height: 1.35;
+  color: var(--muted, #64748b);
+  background: rgba(255, 255, 255, 0.82);
+  border-radius: 6px;
+  padding: 3px 7px;
+  pointer-events: none;
+  max-width: 62%;
+  text-align: right;
+}
+
+/* Loading spinner (no wording). */
+.spinner-wrap { display: grid; place-items: center; padding: 40px 0; flex: 1 1 auto; }
+.spinner {
+  width: 34px; height: 34px; border-radius: 50%;
+  border: 3px solid rgba(79, 110, 247, 0.22);
+  border-top-color: var(--primary, #4f6ef7);
+  animation: spin 0.75s linear infinite;
+  display: block;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 820px) {
   .modal-panel { width: 96vw; height: 92vh; padding: 16px; }
+  .modal-tabs button { padding: 9px 14px; }
 }
 
 /* ---- Workflow strip: New + one button per workflow, scrolls sideways --- */
@@ -1683,3 +1715,57 @@ details.adv[open] summary { border-bottom: 1px solid var(--line, #eef2f7); }
 details.adv > *:not(summary) { margin-left: 16px; margin-right: 16px; }
 details.adv > *:last-child { margin-bottom: 16px; }
 details.adv[open] > .cfg-row:first-of-type, details.adv[open] > .link-btn { margin-top: 14px; }
+
+/* ======================================================================
+   COMPACT + FULL-WIDTH + RESPONSIVE
+   The base type is 20% smaller (html{font-size:80%} in index.css). These
+   overrides tighten the px paddings to match, and let the app use the FULL
+   window width so there are no empty margins left and right.
+   ====================================================================== */
+.app-shell {
+  width: 100%;
+  max-width: none;
+}
+
+.app-header { padding: 15px 24px; gap: 18px; }
+.tab-nav { padding: 0 24px; }
+.tab-nav button { padding: 12px 15px 10px; }
+.view { padding: 24px 24px 44px; }
+
+.table-panel table th,
+.table-panel table td { padding: 9px 11px; }
+.admin-table th,
+.admin-table td { padding: 9px 10px; }
+
+.step-card { padding: 12px 14px; margin-bottom: 12px; }
+.panel { padding: 16px 18px; }
+.kpi-grid { gap: 11px; margin-bottom: 15px; }
+
+/* ---- Tablet ---- */
+@media (max-width: 1000px) {
+  .app-header { padding: 13px 16px; flex-wrap: wrap; gap: 12px; }
+  .tab-nav { padding: 0 12px; }
+  .view { padding: 18px 16px 36px; }
+  .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .config-field-grid.three-columns { grid-template-columns: 1fr 1fr; }
+}
+
+/* ---- Phone ---- */
+@media (max-width: 640px) {
+  html { font-size: 76%; }
+  .app-header { padding: 11px 12px; }
+  .view { padding: 14px 12px 28px; }
+  .kpi-grid { grid-template-columns: 1fr 1fr; }
+  .config-field-grid.three-columns,
+  .grid2, .grid3 { grid-template-columns: 1fr; }
+  .role-list { flex-wrap: wrap; }
+  .modal-panel { width: 100vw; height: 100vh; border-radius: 0; padding: 12px; }
+  .flow-legend-corner { max-width: 90%; font-size: 0.6rem; }
+  .step-head { flex-wrap: wrap; }
+  .step-name { flex: 1 1 100%; order: 3; }
+}
+
+/* Wide screens: keep tables and the builder usable without stretching text lines. */
+@media (min-width: 1700px) {
+  .view { padding-left: 40px; padding-right: 40px; }
+}
