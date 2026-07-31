@@ -2311,6 +2311,11 @@ def _fallback_sentence(event: dict) -> str:
             detail = event.get("detail") or ""
             what = detail.split(":", 1)[1].strip() if ":" in detail else detail
             return f"{base}: {what}." + (f" Reason: {reason}." if reason else "")
+        if etype == "REQUEST_DATA_UPDATED":
+            fields = ", ".join(_names(payload.get("fields"))) or "new details"
+            return f"The request's details were updated with {fields}."
+        if etype == "WORKFLOW_FAILED":
+            return f"The workflow stopped with an error: {event.get('detail') or 'see the logs'}."
         if etype == "HUMAN_DECISION":
             decision = payload.get("decision")
             if decision == "resubmit":

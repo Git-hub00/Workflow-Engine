@@ -361,6 +361,21 @@
   overflow-wrap: anywhere;
 }
 
+/* Marks a field the submitter supplied AFTER we emailed to ask for it, so an
+   approver can see the request is now complete and what arrived late. */
+.added-later {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--success-soft);
+  color: var(--success);
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  white-space: nowrap;
+}
+
 .record-grid dd {
   font-size: 0.85rem;
 }

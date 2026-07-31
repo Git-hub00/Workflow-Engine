@@ -211,24 +211,41 @@ class Handlers:
     def finish(self, txn_id, data, outcome):           # end
         return None
 
-    def merge(self, data, decision):                   # collect-info resubmit
+    # txn_id lets an implementation PERSIST the merged details (see RealHandlers).
+    def merge(self, data, decision, txn_id=None):      # collect-info resubmit
         if not isinstance(decision, dict):
             return data
         corrected = decision.get("data")
         if corrected:
             return {**data, **corrected}
         control = {"decision", "reason", "kind", "idempotency_key", "transaction_id",
-                   "participant", "terminal", "approved", "auto"}
+                   "participant", "terminal", "approved", "auto", "node_id", "claimed_by"}
         extra = {k: v for k, v in decision.items() if k not in control}
         return {**data, **extra} if extra else data
+
+
+def _carries_data(decision) -> bool:
+    """True when a reply supplied FIELD VALUES (not just approve/reject)."""
+    if not isinstance(decision, dict):
+        return False
+    if isinstance(decision.get("data"), dict) and decision["data"]:
+        return True
+    control = {"decision", "reason", "kind", "idempotency_key", "transaction_id",
+               "participant", "terminal", "approved", "auto", "node_id", "claimed_by"}
+    return any(k not in control for k in decision)
 
 
 def _apply_human_decision(node, state, decision, h):
     upd = {"decision": decision or {}}
     if is_quorum(node):
         upd["quorum_approved"] = (decision or {}).get("approved")
-    elif not (node.get("edges") or []):
-        upd["data"] = h.merge(dict(state.get("data") or {}), decision or {})
+    # Fold supplied field values into the request. The condition used to be "this step
+    # has no branches", which meant a step that BOTH asked for missing information and
+    # had approve/reject branches silently DISCARDED everything the person supplied.
+    # What matters is whether the reply carried data, not the step's branch shape.
+    elif not (node.get("edges") or []) or _carries_data(decision):
+        upd["data"] = h.merge(dict(state.get("data") or {}), decision or {},
+                              state.get("txn_id"))
     upd["_next"] = compute_next(node, {**state, **upd})
     return upd
 

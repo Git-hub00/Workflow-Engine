@@ -56,13 +56,40 @@ class RealHandlers(Handlers):
         # spellings are accepted now.
         import invoice_activities as A
         if action in ("extract_fields", "extract"):
-            return _run(A.extract_fields(txn_id)) or data
+            # MERGE, never replace. extract reads the stored request details, so a
+            # plain overwrite would throw away anything already collected in this run
+            # (e.g. fields a vendor supplied after a "more information needed" email)
+            # if the flow ever passes through an extract step again. Stored values win
+            # for the keys they define; everything already in hand is kept.
+            stored = _run(A.extract_fields(txn_id)) or {}
+            return {**data, **{k: v for k, v in stored.items() if v not in (None, "")}} or data
         if action in ("post_to_record", "post_to_erp"):
             _run(A.post_to_erp(txn_id, data))
             return data
         if action:
             print(f"run_action: no built-in action named {action!r}; step did nothing")
         return data
+
+    def merge(self, data, decision, txn_id=None):
+        """Fold a person's reply into the request's details AND PERSIST them.
+
+        The base implementation merges into the workflow's in-memory state only. That
+        state is invisible to the rest of the product: the Task Inbox card, the Monitor
+        list and the notification emails all read transaction.data_snapshot. So a
+        vendor could reply with the missing PO number and the approver would still see
+        an incomplete request. Writing the merged values back to the row is what makes
+        the newly supplied information show up everywhere."""
+        merged = super().merge(data, decision, txn_id)
+        new_values = {k: v for k, v in merged.items() if k not in data or data[k] != v}
+        if new_values and txn_id:
+            import invoice_activities as A
+            try:
+                _run(A.save_request_data(txn_id, new_values))
+            except Exception as exc:
+                # Never lose the run over a bookkeeping write; the values are still in
+                # the workflow state, so the flow itself continues correctly.
+                print(f"merge: could not persist supplied fields {sorted(new_values)}: {exc}")
+        return merged
 
     def decide(self, node, data, cfg, txn_id=None):
         """Run the bounded decision AND record it in the audit trail.

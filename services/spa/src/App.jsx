@@ -287,19 +287,39 @@ function Spinner() {
   )
 }
 
-function InvoiceFields({ data }) {
+// Field names the submitter supplied LATER, in reply to a "more information needed"
+// email. Read from the audit trail, so the card can show at a glance that the request
+// is now complete and which parts arrived afterwards.
+function suppliedLater(history) {
+  const names = new Set()
+  for (const event of history || []) {
+    if (event?.type !== 'REQUEST_DATA_UPDATED') continue
+    for (const field of event.payload?.fields || []) names.add(field)
+  }
+  return names
+}
+
+function RequestFields({ data, addedLater }) {
   if (!data) {
-    return <p className="muted">Invoice snapshot is unavailable in the recent transaction list.</p>
+    return <p className="muted">Request details are unavailable in the recent transaction list.</p>
   }
 
   const fields = Object.entries(data)
-  if (!fields.length) return <p className="muted">The invoice snapshot is empty.</p>
+  if (!fields.length) return <p className="muted">This request has no details yet.</p>
+  const later = addedLater || new Set()
 
   return (
     <dl className="field-grid">
       {fields.map(([name, value]) => (
         <div key={name}>
-          <dt>{name}</dt>
+          <dt>
+            {name}
+            {later.has(name) && (
+              <span className="added-later" title="Supplied by the submitter after we asked for it">
+                added later
+              </span>
+            )}
+          </dt>
           <dd>{name === 'amount' ? formatMoney(value) : pretty(value)}</dd>
         </div>
       ))}
@@ -679,6 +699,10 @@ function TaskInbox({ roles, username }) {
           // Approve/Reject — clicking it submitted {decision:'approve'} for a step
           // that actually required fields.
           const fieldsPending = !isFinanceTask && detailsPending(task)
+          // Fields this step asked the submitter for (set by the engine on the task).
+          const needFields = Array.isArray(task.completion_policy?.need)
+            ? task.completion_policy.need
+            : []
           const canSubmitFinanceDecision =
             task.current_user_claimed && !task.current_user_decision && task.can_decide
           // Did GET /v1/tasks actually enrich this finance task with quorum fields?
@@ -720,9 +744,20 @@ function TaskInbox({ roles, username }) {
 
               <div className="task-detail-grid">
                 <div>
-                  <h4>Invoice</h4>
-                  {!taskDetails && <p className="muted">Loading invoice snapshot…</p>}
-                  {taskDetails && <InvoiceFields data={taskDetails.invoice} />}
+                  <h4>Request details</h4>
+                  {!taskDetails && <p className="muted">Loading request details…</p>}
+                  {taskDetails && (
+                    <RequestFields
+                      data={taskDetails.invoice}
+                      addedLater={suppliedLater(taskDetails.history)}
+                    />
+                  )}
+                  {/* What this step is still waiting for, when it asked for fields. */}
+                  {needFields.length > 0 && (
+                    <p className="muted">
+                      Waiting for the submitter to supply: {needFields.join(', ')}
+                    </p>
+                  )}
                 </div>
                 <div className="ai-summary">
                   <h4>AI review summary</h4>

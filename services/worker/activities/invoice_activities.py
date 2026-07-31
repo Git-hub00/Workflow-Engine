@@ -180,6 +180,46 @@ async def extract_fields(txn_id: str) -> dict:
     return snapshot or {}
 
 
+# WHY save_request_data: the request's stored details (transaction.data_snapshot) are
+# what the Task Inbox card, the Monitor list and the notification emails all read.
+#
+# THE BUG THIS FIXES: when a vendor replied to a "we need more information" email, the
+# supplied fields were merged into the WORKFLOW's in-memory state only. Nothing ever
+# wrote them back to the transaction row, so:
+#   * the approver's task card still showed only the fields from the original email
+#     (the newly supplied PO number / cost centre / tax id were invisible), and
+#   * anything reading the row back — extract_fields, the Monitor summary, the outcome
+#     email — silently saw the OLD, incomplete details.
+# Merging in SQL (existing || new) rather than overwriting means a concurrent write
+# can never drop fields, and re-running is harmless.
+@activity.defn
+async def save_request_data(txn_id: str, data: dict) -> dict:
+    if not isinstance(data, dict) or not data:
+        return {}
+    with engine.begin() as conn:
+        # jsonb || jsonb merges the two objects with the RIGHT side winning, so this is
+        # "keep everything already there, add/correct these". CAST(... AS jsonb) is used
+        # rather than the '{}'::jsonb shorthand to keep the statement free of any ':'
+        # that a reader might mistake for a bind parameter.
+        merged = conn.execute(
+            text('UPDATE "transaction" '
+                 "SET data_snapshot = COALESCE(data_snapshot, CAST('{}' AS jsonb)) "
+                 "                    || CAST(:new AS jsonb) "
+                 "WHERE id = CAST(:id AS uuid) "
+                 "RETURNING data_snapshot"),
+            {"new": json.dumps(data), "id": txn_id},
+        ).scalar_one_or_none()
+        # Audit the change so the Monitor timeline shows what the vendor supplied.
+        await append_event(
+            txn_id, "data", "REQUEST_DATA_UPDATED", "WorkflowEngine",
+            "Request details updated with newly supplied information: "
+            + ", ".join(sorted(data)),
+            payload={"fields": sorted(data), "data": data},
+            idempotency_key=None, conn=conn,
+        )
+    return merged or {}
+
+
 # WHY ai_review: the bounded decision step of the invoice flow. It runs the
 # deterministic-rules-plus-LLM-rationale node (review_invoice) to pick a route,
 # then records that decision in the audit log. Called by the workflow after
@@ -502,8 +542,19 @@ def _resolve_recipients(txn_id: str, recipient: dict | None) -> list:
     if recipient.get("to_email"):
         return [recipient["to_email"]]
     if recipient.get("to") == "submitter":
+        # ONLY the person who submitted this request. A "we still need X" email must
+        # reach the vendor who sent the original mail and NOBODY else — falling back to
+        # the generic NOTIFY_TO inbox used to ask an unrelated address for a vendor's
+        # PO number, which is both confusing and a small data leak. If the submitter
+        # cannot be identified we send nothing and say why; the step's own deadline
+        # reminder is what surfaces the problem.
         email = _submitted_by_email(txn_id)
-        return [email] if email else _fallback_recipients()
+        if email:
+            return [email]
+        print(f"notify: cannot identify the submitter of transaction {txn_id}, so the "
+              f"request for more information was NOT sent (it must only go to the "
+              f"vendor who submitted the request)")
+        return []
     if recipient.get("to_role"):
         # Scope role recipients to the people assigned to THIS workflow. No
         # NOTIFY_TO fallback here: mailing an unrelated inbox would leak another

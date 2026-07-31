@@ -49,6 +49,7 @@ from invoice_activities import (  # noqa: E402  (import after sys.path tweak)
     create_human_task,
     notify,
     post_to_erp,
+    save_request_data,
     set_transaction_status,
 )
 from graph_orchestrator import GraphOrchestratorWorkflow  # noqa: E402  (THE engine: LangGraph)
@@ -67,7 +68,7 @@ async def main():
         # graph_advance is a SYNC activity (runs the LangGraph run in a worker thread).
         workflows=[GraphOrchestratorWorkflow],
         activities=[append_event, extract_fields, create_human_task, notify, post_to_erp,
-                    set_transaction_status, graph_advance],
+                    save_request_data, set_transaction_status, graph_advance],
         activity_executor=ThreadPoolExecutor(max_workers=8),
     )
 
