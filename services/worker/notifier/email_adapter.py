@@ -462,6 +462,100 @@ def process_message(raw_bytes: bytes, api_base_url: str, mailbox_name: str = "",
         return f"skipped (could not process message: {type(exc).__name__}: {exc}) status=none"
 
 
+# Set once, the first time a BODY.PEEK[] fetch does not give us a usable body, so
+# the warning is printed once instead of every 15 seconds.
+_peek_unsupported = False
+
+
+def _body_from_fetch(entry) -> bytes | None:
+    """Pull the raw message out of one IMAP FETCH result, WHATEVER the server called it.
+
+    WHY this is key-agnostic instead of reading one fixed key: a server answers a
+    `BODY.PEEK[]` request with the section name `BODY[]` (the `.PEEK` is dropped),
+    but the exact key also varies with the server and the IMAPClient version — it
+    can arrive as `BODY[]`, `RFC822`, or `BODY[TEXT]`. Hard-coding one name meant
+    that if the server used a different one we found NOTHING, logged "no body", and
+    every message stalled unread forever — the whole inbox silently stopped being
+    processed. So: try the known names, then fall back to the largest bytes value in
+    the response, which is always the message itself."""
+    if not isinstance(entry, dict):
+        return None
+    for key in (b"BODY[]", b"RFC822", b"BODY[TEXT]", b"RFC822.TEXT"):
+        value = entry.get(key)
+        if isinstance(value, (bytes, bytearray)) and value:
+            return bytes(value)
+    # Unknown key: the message body is by far the biggest bytes value present
+    # (FLAGS/UID are tuples/ints, ENVELOPE is short). Keys are compared defensively —
+    # a non-bytes key must not raise here, because an exception in this helper would
+    # cost us the message.
+    candidates = []
+    for key, value in entry.items():
+        if not isinstance(value, (bytes, bytearray)) or len(value) <= 40:
+            continue
+        name = key.upper() if isinstance(key, bytes) else str(key).upper().encode()
+        if name.startswith((b"FLAGS", b"UID", b"INTERNALDATE", b"SEQ")):
+            continue
+        candidates.append(bytes(value))
+    if candidates:
+        return max(candidates, key=len)
+    return None
+
+
+def _key_names(entry) -> list:
+    """Response key names as readable strings (for the one-off diagnostic log)."""
+    if not isinstance(entry, dict):
+        return []
+    out = []
+    for key in entry:
+        try:
+            out.append(key.decode("ascii", "replace") if isinstance(key, bytes) else str(key))
+        except Exception:
+            out.append(repr(key))
+    return sorted(out)
+
+
+def fetch_raw_message(client, uid):
+    """Raw RFC822 bytes for one uid, as (raw, note). `note` is a log line or None.
+
+    Prefers BODY.PEEK[] because plain RFC822 makes the SERVER set \\Seen as a side
+    effect of the read — before we know whether the decision was delivered — which is
+    how a transient failure used to lose a reply permanently.
+
+    But reading the mail at all matters more than the flag: if PEEK yields nothing
+    usable we fall back to RFC822 for that message, log it once, and carry on. The
+    fallback is strictly yesterday's behaviour, so the worst case here is 'works, with
+    the old read-marking caveat' — never 'the inbox stops working'."""
+    global _peek_unsupported
+    if not _peek_unsupported:
+        try:
+            resp = client.fetch([uid], ["BODY.PEEK[]"])
+            raw = _body_from_fetch((resp or {}).get(uid))
+            if raw:
+                return raw, None
+            keys = _key_names((resp or {}).get(uid))
+            _peek_unsupported = True
+            print(f"email adapter: BODY.PEEK[] returned no message body "
+                  f"(keys seen: {keys or 'none'}); falling back to RFC822 for this "
+                  f"mailbox. Mail WILL be processed; note that RFC822 marks messages "
+                  f"read on fetch.")
+        except Exception as exc:
+            _peek_unsupported = True
+            print(f"email adapter: BODY.PEEK[] not usable on this server ({exc}); "
+                  f"falling back to RFC822.")
+
+    # Fallback (also the path taken once PEEK is known to be unsupported).
+    try:
+        resp = client.fetch([uid], ["RFC822"])
+        raw = _body_from_fetch((resp or {}).get(uid))
+        if raw:
+            return raw, None
+        return None, "error: fetch returned no message body (will retry)"
+    except Exception as exc:
+        # One unreadable uid (deleted/moved between SEARCH and FETCH, or a server
+        # hiccup) must not abort the pass for every OTHER pending message.
+        return None, f"error: fetch failed: {exc}"
+
+
 def poll_once(client, api_base_url: str, mailbox_name: str = "",
               mailbox_address: str = "") -> list[str]:
     # One polling pass: process every UNSEEN message, marking it \Seen ONLY when
@@ -479,25 +573,10 @@ def poll_once(client, api_base_url: str, mailbox_name: str = "",
     results = []
     uids = client.search(["UNSEEN"])
     for uid in uids:
-        # BODY.PEEK[] — NOT RFC822. Fetching "RFC822" makes the IMAP SERVER set the
-        # \Seen flag as a side effect of the read, BEFORE we know whether we managed
-        # to deliver the decision. So the careful "don't mark \Seen on error" logic
-        # below was useless: the mail was already read, the next SEARCH UNSEEN never
-        # returned it again, and a transient API outage SILENTLY LOST the reply
-        # forever. BODY.PEEK[] fetches the identical bytes WITHOUT setting \Seen, so
-        # we alone decide when a message counts as handled.
-        try:
-            resp = client.fetch([uid], ["BODY.PEEK[]"])
-            # Servers key the response as BODY[] even though we asked with .PEEK.
-            entry = resp.get(uid) or {}
-            raw = entry.get(b"BODY[]") or entry.get(b"RFC822")
-        except Exception as exc:
-            # One unreadable uid (deleted/moved between SEARCH and FETCH, or a
-            # server hiccup) must not abort the pass for every OTHER pending reply.
-            results.append(f"uid {uid}: error: fetch failed: {exc}")
-            continue
+        raw, note = fetch_raw_message(client, uid)
+        if note:
+            results.append(f"uid {uid}: {note}")
         if not raw:
-            results.append(f"uid {uid}: error: fetch returned no body (will retry)")
             continue
         result = process_message(raw, api_base_url, mailbox_name, mailbox_address)
         results.append(f"uid {uid}: {result}")
@@ -543,6 +622,30 @@ def main():
     if not clients:
         print("ERROR: no mailbox connections succeeded")
         return
+
+    # Report which workflow each mailbox is bound to. A mailbox bound to NOTHING
+    # accepts mail and then skips every message, which looks identical to "the adapter
+    # is not reading mail" — this makes the real cause obvious at a glance.
+    # The API is only "started", not necessarily ready, when this runs, so an
+    # unreachable API is reported as UNKNOWN rather than as a wrong "not bound".
+    api_up = False
+    try:
+        api_up = requests.get(f"{api_base_url}/v1/definitions", timeout=10).status_code == 200
+    except Exception:
+        api_up = False
+    if not api_up:
+        print(f"  (cannot reach {api_base_url} yet to check mailbox bindings — polling anyway; "
+              f"each message will report what happened to it)")
+    else:
+        for box, _ in clients:
+            process_key, _pdd = _process_for_mailbox(api_base_url, box["name"])
+            if process_key:
+                print(f"  mailbox '{box['name']}' ({box['address']}) -> workflow '{process_key}'")
+            else:
+                print(f"  WARNING: mailbox '{box['name']}' ({box['address']}) is NOT bound to any "
+                      f"published workflow, so mail arriving there will be SKIPPED. Fix: open the "
+                      f"Builder, set that workflow's Mailbox field to '{box['name']}', and save.")
+
     print(f"Polling {len(clients)} mailbox(es) every 15s (POSTing to {api_base_url}/v1/events). "
           "Ctrl+C to stop.")
 
